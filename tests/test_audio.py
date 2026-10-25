@@ -1,9 +1,10 @@
 import numpy as np
 import pytest
 
-from src.audio.audio_feedback import chime_for_cue, synthesize_chime
+from src.audio.audio_feedback import AudioOutput, chime_for_cue, synthesize_chime
 from src.audio.pace_analyzer import PaceAnalyzer
 from src.audio.volume_analyzer import VolumeAnalyzer, rms, rms_to_db
+from src.capture.audio_stream import StreamResampler
 from src.demo_scene import audio_chunk
 
 
@@ -105,6 +106,66 @@ def test_phrase_pauses_keep_comfortable_speech_from_running_on():
         audio_chunk("speech", 0, 9 * sample_rate, sample_rate), 9.0
     )
     assert reading.run_on is False
+
+
+def test_resampled_capture_still_crosses_the_volume_threshold():
+    source_rate = 48000
+    times = np.arange(int(0.5 * source_rate)) / source_rate
+    loud_native = (0.2 * np.sin(2 * np.pi * 220.0 * times)).astype(np.float32)
+    quiet_native = (0.003 * np.sin(2 * np.pi * 220.0 * times)).astype(np.float32)
+    loud = StreamResampler(source_rate, 16000).process(loud_native)
+    quiet = StreamResampler(source_rate, 16000).process(quiet_native)
+    analyzer = VolumeAnalyzer(threshold_db=42.0, reference=1e-4, sample_rate=16000)
+    assert analyzer.update(loud, 0.5).db > 42.0
+    quiet_analyzer = VolumeAnalyzer(
+        threshold_db=42.0, reference=1e-4, sample_rate=16000
+    )
+    assert quiet_analyzer.update(quiet, 0.5).db < 42.0
+
+
+def test_speaker_stream_uses_the_device_rate_and_mixes_a_chime():
+    class FakeOutput:
+        def __init__(self) -> None:
+            self.kwargs = None
+            self.callback = None
+
+        def query_devices(self, kind=None):
+            assert kind == "output"
+            return {
+                "default_samplerate": 48000.0,
+                "max_output_channels": 2,
+                "name": "speakers",
+            }
+
+        def OutputStream(self, **kwargs):
+            if kwargs["channels"] == 1:
+                raise OSError("mono output refused")
+            self.kwargs = kwargs
+            self.callback = kwargs["callback"]
+            return self
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    device = FakeOutput()
+    output = AudioOutput(16000)
+    assert output.start(sd_module=device) is True
+    assert device.kwargs["samplerate"] == 48000
+    assert device.kwargs["channels"] == 2
+    assert device.kwargs["blocksize"] == 768
+    output.write(np.zeros(1600, np.float32))
+    output.play(np.full(160, 0.8, np.float32))
+    block = np.zeros((2000, 2), np.float32)
+    device.callback(block, 2000, None, None)
+    output.close()
+    assert float(np.max(block[:, 0])) == pytest.approx(0.8, abs=0.05)
+    assert float(np.max(block[:, 1])) == pytest.approx(0.8, abs=0.05)
 
 
 def test_chime_is_a_bounded_tone_at_the_requested_frequency():

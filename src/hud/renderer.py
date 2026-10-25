@@ -189,6 +189,11 @@ class PreviewWindow:
         return self.interpret_key(_key_name(key))
 
     def _show_pygame(self, frame: np.ndarray) -> str | None:
+        # Set before importing pygame. SDL reads the driver when the mixer
+        # starts, and a real driver takes the sound card from PortAudio.
+        import os
+
+        os.environ["SDL_AUDIODRIVER"] = "dummy"
         import pygame
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -198,6 +203,8 @@ class PreviewWindow:
         mode = (self.fullscreen, target)
         if self._screen is None or (matches and self._applied != mode):
             pygame.init()
+            if pygame.mixer.get_init():
+                pygame.mixer.quit()
             flags = pygame.FULLSCREEN if self.fullscreen and matches else 0
             size = target if matches else (width, height)
             self._screen = pygame.display.set_mode(size, flags)

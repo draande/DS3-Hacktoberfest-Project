@@ -1,4 +1,12 @@
-"""Microphone and synthetic audio capture with a thread-safe ring buffer."""
+"""Microphone and synthetic audio capture with a thread-safe ring buffer.
+
+The analyzers stay at 16 kHz. Capture opens at the device's native rate
+(commonly 48 kHz on Windows) and :class:`StreamResampler` converts on the way
+into the ring the rest of the app reads. A 16 kHz mono stream is a common
+reason the device accepts the open and then stays silent. The input stream
+is also stopped and started once after open: PortAudio otherwise reports the
+stream active without ever calling the callback.
+"""
 
 from __future__ import annotations
 
@@ -127,6 +135,51 @@ class SyntheticAudioSource:
         return None
 
 
+class StreamResampler:
+    """Streaming linear resampler. Chunks concatenate without a gap or overlap."""
+
+    def __init__(self, source_rate: int, target_rate: int) -> None:
+        if source_rate <= 0 or target_rate <= 0:
+            raise ValueError("sample rates must be positive")
+        self.source_rate = int(source_rate)
+        self.target_rate = int(target_rate)
+        self._pending = np.zeros(0, dtype=np.float64)
+        self._pos = 0.0
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        incoming = np.asarray(samples, dtype=np.float64).reshape(-1)
+        if incoming.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        if self.source_rate == self.target_rate:
+            return incoming.astype(np.float32)
+        data = (
+            np.concatenate((self._pending, incoming))
+            if self._pending.size
+            else incoming
+        )
+        if data.size < 2:
+            self._pending = data
+            return np.zeros(0, dtype=np.float32)
+        step = self.source_rate / self.target_rate
+        limit = data.size - 1
+        if self._pos >= limit:
+            self._pending = data
+            return np.zeros(0, dtype=np.float32)
+        count = int((limit - self._pos) / step)
+        if count <= 0:
+            self._pending = data
+            return np.zeros(0, dtype=np.float32)
+        positions = self._pos + step * np.arange(count, dtype=np.float64)
+        index = positions.astype(np.int64)
+        fraction = positions - index
+        values = data[index] * (1.0 - fraction) + data[index + 1] * fraction
+        end = float(positions[-1] + step)
+        keep = min(data.size, int(end))
+        self._pending = data[keep:]
+        self._pos = end - keep
+        return values.astype(np.float32)
+
+
 def sine_generator(frequency: float, amplitude: float, sample_rate: int):
     def generate(start: int, count: int) -> np.ndarray:
         t = (start + np.arange(count, dtype=np.float32)) / sample_rate
@@ -153,47 +206,59 @@ class MicrophoneStream:
     ) -> None:
         self.sample_rate = sample_rate
         self.block_size = block_size
+        self.buffer_seconds = buffer_seconds
+        self.capture_rate = sample_rate
         self.buffer = RingBuffer(max(block_size, int(sample_rate * buffer_seconds)))
+        self._resampler = StreamResampler(sample_rate, sample_rate)
         self._stream = None
         self._status_overflows = 0
 
-    def start(self) -> None:
+    def start(self, sd_module=None) -> None:
+        sd = sd_module if sd_module is not None else _load_sounddevice()
         try:
-            import sounddevice as sd
-        except OSError as exc:
+            info = sd.query_devices(kind="input")
+            rate = int(round(float(info.get("default_samplerate") or 0)))
+            max_channels = int(info.get("max_input_channels") or 0)
+        except Exception as exc:
+            raise AudioCaptureError(_microphone_error(exc)) from exc
+        if rate <= 0:
+            rate = self.sample_rate
+        if max_channels < 1:
             raise AudioCaptureError(
-                "PortAudio library not found. Install libportaudio2, "
-                "or run `python main.py --demo` without a microphone."
-            ) from exc
-        except ImportError as exc:  # pragma: no cover
-            raise AudioCaptureError("sounddevice is not installed") from exc
+                "No microphone input channels are available. "
+                "Check that a microphone is connected and that the OS allows apps to use it."
+            )
+        self.capture_rate = rate
+        self.buffer = RingBuffer(max(self.block_size, int(rate * self.buffer_seconds)))
+        self._resampler = StreamResampler(rate, self.sample_rate)
+        try:
+            self._stream = _open_input_stream(sd, self._on_audio, rate, max_channels)
+        except Exception as exc:
+            raise AudioCaptureError(_microphone_error(exc)) from exc
 
-        def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
+    def _on_audio(self, indata, frames, time_info, status) -> None:  # noqa: ARG001
+        try:
             if status:
                 self._status_overflows += 1
-            self.buffer.write(indata[:, 0] if indata.ndim == 2 else indata)
-
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                blocksize=self.block_size,
-                dtype="float32",
-                callback=callback,
-            )
-            self._stream.start()
-        except Exception as exc:
-            raise AudioCaptureError(
-                f"Could not open the microphone ({exc}). Run with --demo to skip audio hardware."
-            ) from exc
+            data = np.asarray(indata, dtype=np.float32)
+            if data.ndim == 2 and data.shape[1] > 1:
+                mono = data.mean(axis=1)
+            elif data.ndim == 2:
+                mono = data[:, 0]
+            else:
+                mono = data.reshape(-1)
+            self.buffer.write(mono)
+        except Exception:
+            self._status_overflows += 1
 
     def read_latest(self, seconds: float) -> AudioChunk:
-        count = int(seconds * self.sample_rate)
-        samples = self.buffer.read_latest(count)
+        count = int(seconds * self.capture_rate)
+        native = self.buffer.read_latest(count)
+        samples = StreamResampler(self.capture_rate, self.sample_rate).process(native)
         return AudioChunk(samples=samples, timestamp=0.0, sample_rate=self.sample_rate)
 
     def pop_ready(self) -> AudioChunk:
-        samples = self.buffer.pop_all()
+        samples = self._resampler.process(self.buffer.pop_all())
         return AudioChunk(samples=samples, timestamp=0.0, sample_rate=self.sample_rate)
 
     def close(self) -> None:
@@ -209,3 +274,98 @@ class MicrophoneStream:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _load_sounddevice():
+    try:
+        import sounddevice as sd
+    except OSError as exc:
+        raise AudioCaptureError(
+            "PortAudio library not found. Install libportaudio2 "
+            "(or the PortAudio runtime on Windows), "
+            "or run `python main.py --demo` without a microphone."
+        ) from exc
+    except ImportError as exc:  # pragma: no cover
+        raise AudioCaptureError("sounddevice is not installed") from exc
+    return sd
+
+
+def _microphone_error(exc: Exception) -> str:
+    text = str(exc).strip() or exc.__class__.__name__
+    hint = ""
+    lowered = text.lower()
+    if any(word in lowered for word in ("denied", "permission", "access", "privacy")):
+        hint = (
+            " On Windows, allow microphone access in Settings > Privacy > Microphone."
+        )
+    return (
+        f"Could not open the microphone ({text}).{hint} "
+        "Run with --demo to skip audio hardware."
+    )
+
+
+def _native_blocksize(rate: int) -> int:
+    """About 16 ms, which stays under the 20 ms capture budget.
+
+    ``blocksize=0`` lets PortAudio pick the period. On the Pulse plugin that
+    period is short enough that a Python callback underruns on every block, so
+    playback collapses into clicks and the recording is mostly silence.
+    """
+    return max(64, int(round(rate * 0.016)))
+
+
+def _channel_choices(max_channels: int) -> list[int]:
+    """Prefer stereo. A mono stream can open and then never deliver samples."""
+    if max_channels >= 2:
+        return [2, 1]
+    if max_channels == 1:
+        return [1]
+    return []
+
+
+def _prime_input_stream(stream) -> None:
+    """Make PortAudio actually call the input callback.
+
+    On the ALSA Pulse plugin the first ``start()`` reports the stream active
+    and then never delivers a buffer. The same stall shows up on some other
+    PortAudio hosts. Stopping and starting again is what makes samples arrive.
+    A later output stream does not repair an input that was left unprimed, so
+    capture stays silent for the whole session.
+    """
+    stream.start()
+    stream.stop()
+    stream.start()
+
+
+def _open_input_stream(sd, callback, rate: int, max_channels: int):
+    """Open at the native rate. Stereo first, then mono.
+
+    A ~16 ms block is requested first. If the device rejects it, PortAudio's
+    own period (``blocksize=0``) is tried before the next channel count.
+    """
+    choices = _channel_choices(max_channels)
+    last: Exception | None = None
+    for channels in choices:
+        for blocksize in (_native_blocksize(rate), 0):
+            stream = None
+            try:
+                stream = sd.InputStream(
+                    samplerate=rate,
+                    channels=channels,
+                    dtype="float32",
+                    blocksize=blocksize,
+                    latency="high",
+                    callback=callback,
+                )
+                _prime_input_stream(stream)
+                return stream
+            except Exception as exc:
+                last = exc
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+    if last is None:
+        raise AudioCaptureError("No microphone input channels are available.")
+    raise last

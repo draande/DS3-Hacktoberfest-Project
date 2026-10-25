@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from src.audio.audio_feedback import chime_for_cue, play_chime
+from src.audio.audio_feedback import AudioOutput, chime_for_cue
 from src.audio.pace_analyzer import PaceAnalyzer
 from src.audio.volume_analyzer import VolumeAnalyzer
 from src.capture.audio_stream import AudioCaptureError, MicrophoneStream
@@ -110,7 +111,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument(
         "--chimes",
         action="store_true",
-        help="Play synthesized cue chimes when PortAudio is available",
+        help="Play cue chimes and, in the demo, the scripted audio. Live mode and --display do this too.",
     )
     parser.add_argument(
         "--offline",
@@ -254,6 +255,7 @@ def run_session(
     summary = RunSummary(
         demo=options.demo, theme=control.theme_name, fallback=client.used_fallback
     )
+    playback = _start_playback(options, app_config.audio.sample_rate, summary)
 
     scene = (
         DemoScene(width, height, app_config.audio.sample_rate) if options.demo else None
@@ -280,6 +282,8 @@ def run_session(
         except (CameraUnavailable, FileNotFoundError, RuntimeError) as exc:
             summary.error = str(exc)
             client.close()
+            if playback is not None:
+                playback.close()
             return summary
         microphone = MicrophoneStream(
             sample_rate=app_config.audio.sample_rate,
@@ -291,6 +295,11 @@ def run_session(
         except AudioCaptureError as exc:
             summary.notes.append(str(exc))
             microphone = None
+        else:
+            if microphone.capture_rate != microphone.sample_rate:
+                summary.notes.append(
+                    f"microphone {microphone.capture_rate} Hz resampled to {microphone.sample_rate} Hz"
+                )
         backend = MediaPipeBackend()
         if not backend.load():
             summary.notes.append(backend.error or "MediaPipe models are not loaded")
@@ -298,6 +307,7 @@ def run_session(
     sample_rate = app_config.audio.sample_rate
     audio_cursor = 0
     frame_index = 0
+    pace_clock = time.perf_counter()
     try:
         while frame_limit is None or frame_index < frame_limit:
             timestamp = frame_index / fps
@@ -318,6 +328,8 @@ def run_session(
                 face_landmarks = sample.face
                 hand = sample.hand
                 audio = sample.audio
+                if playback is not None and playback.active:
+                    playback.write(audio)
             else:
                 assert video is not None
                 video_frame = video.read()
@@ -409,10 +421,9 @@ def run_session(
                     active.get("bullets") or [active["display_text"]], timestamp
                 )
                 if active.get("audio_chime"):
-                    chime = chime_for_cue(active["cue_type"], sample_rate)
                     summary.chimes += 1
-                    if options.chimes:
-                        play_chime(chime, sample_rate)
+                    if playback is not None and playback.active:
+                        playback.play(chime_for_cue(active["cue_type"], sample_rate))
 
             remaining = max(0.0, timer_seconds - timestamp)
             ratio = remaining / timer_seconds if timer_seconds else 0.0
@@ -452,6 +463,15 @@ def run_session(
                         summary.actions.append((timestamp, action))
                     if control.theme_name != renderer.theme.key:
                         renderer.set_theme(app_config.theme(control.theme_name))
+            if scene is not None and (
+                preview is not None or (playback is not None and playback.active)
+            ):
+                pace_clock += 1.0 / fps
+                delay = pace_clock - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    pace_clock = time.perf_counter()
             frame_index += 1
     finally:
         if video is not None:
@@ -462,8 +482,29 @@ def run_session(
             backend.close()
         if preview is not None:
             preview.close()
+        if playback is not None:
+            playback.close()
         client.close()
     return summary
+
+
+def _start_playback(
+    options: RunOptions, sample_rate: int, summary: RunSummary
+) -> AudioOutput | None:
+    """Speakers are used for live coaching, --display, and --chimes.
+
+    Headless demo runs stay silent so tests do not open a device.
+    """
+    if not (options.chimes or options.display or not options.demo):
+        return None
+    playback = AudioOutput(sample_rate)
+    if not playback.start():
+        summary.notes.append(playback.error or "Audio output is unavailable.")
+    elif playback.output_rate != sample_rate:
+        summary.notes.append(
+            f"speakers {playback.output_rate} Hz, cues mixed from {sample_rate} Hz"
+        )
+    return playback
 
 
 def main(argv: list[str] | None = None) -> int:
