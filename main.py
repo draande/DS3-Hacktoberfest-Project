@@ -1,5 +1,5 @@
 def main():
-    print("Hello from ds3-hacktoberfest-project!")
+    print("Hello from Wingman!")
 
 
 if __name__ == "__main__":
