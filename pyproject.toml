@@ -1,15 +1,25 @@
 [project]
 name = "wingman"
 version = "0.1.0"
-description = "Add your description here"
+description = "Wingman smart-glasses presentation and social-cue assistant"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "google-genai>=2.33.0",
+    "mediapipe>=1.1.1",
+    "numpy>=2.5.4",
+    "opencv-python>=5.0.0.93",
+    "pygame>=2.6.1",
+    "pyyaml>=6.0.3",
+    "scipy>=1.18.1",
+    "sounddevice>=0.5.6",
+]
 
 [dependency-groups]
 dev = [
     "black>=26.10.1",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.pytest.ini_options]
