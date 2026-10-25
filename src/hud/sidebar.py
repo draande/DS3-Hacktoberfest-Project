@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -33,6 +34,10 @@ class FeedbackSidebar:
         self.fade_seconds = max(0.0, float(fade_seconds))
         self._items: list[_Bullet] = []
         self._insights: list[_Bullet] = []
+        self._ask_question = ""
+        self._ask_phase = "idle"
+        self._ask_lines: list[str] = []
+        self._ask_started = 0.0
 
     def push(self, texts, now: float) -> None:
         incoming = normalize_bullets(texts)
@@ -51,6 +56,39 @@ class FeedbackSidebar:
     def visible_insights(self, now: float) -> list[tuple[str, float]]:
         del now
         return [(item.text, 1.0) for item in self._insights]
+
+    def show_ask(
+        self,
+        question: str,
+        phase: str,
+        lines,
+        started: float | None = None,
+    ) -> None:
+        """Remember a direct question. It stays until the next ask replaces it."""
+        self._ask_question = " ".join(str(question or "").split())
+        self._ask_phase = phase or "idle"
+        self._ask_lines = [str(line) for line in lines if str(line).strip()]
+        if started is None:
+            self._ask_started = time.monotonic()
+        else:
+            self._ask_started = float(started)
+
+    def visible_ask(self) -> list[str]:
+        """``YOU``, then ``THINKING... Ns`` or an ``ASK`` block. Not trimmed to six words."""
+        if self._ask_phase == "idle":
+            return []
+        rows: list[str] = []
+        if self._ask_question:
+            rows.append(f"YOU: {self._ask_question}")
+        if self._ask_phase == "thinking":
+            elapsed = max(0, int(time.monotonic() - self._ask_started))
+            rows.append(f"THINKING... {elapsed}s")
+        elif self._ask_phase == "listening":
+            rows.append("LISTENING...")
+        else:
+            rows.append("ASK")
+            rows.extend(self._ask_lines)
+        return rows
 
     def visible(self, now: float) -> list[tuple[str, float]]:
         shown: list[tuple[str, float]] = []
@@ -93,8 +131,9 @@ def draw_sidebar(
     avatar_widget: AvatarWidget,
     coaching_status: str = "offline",
     insights: list[tuple[str, float]] | None = None,
+    ask_rows: list[str] | None = None,
 ) -> None:
-    """Fill the side panel, paint the avatar slot, then cue and insight lines."""
+    """Fill the side panel, paint the avatar slot, then cue, insight, and ask lines."""
     if panel.w <= 1 or panel.h <= 1:
         return
     _fill_panel(image, panel, theme)
@@ -104,7 +143,9 @@ def draw_sidebar(
         (avatar_box.x, avatar_box.y, avatar_box.w, avatar_box.h),
         avatar_state,
     )
-    _draw_bullets(image, panel, avatar_box, bullets, theme, insights or [])
+    _draw_bullets(
+        image, panel, avatar_box, bullets, theme, insights or [], ask_rows or []
+    )
     _draw_coaching_badge(image, panel, theme, coaching_status)
 
 
@@ -145,6 +186,49 @@ def _draw_border(image: np.ndarray, panel: WidgetBox, theme: Theme) -> None:
         cv2.line(image, corner, vertical, color, 1, cv2.LINE_AA)
 
 
+def draw_ask_bar(
+    image: np.ndarray,
+    draft: str | None,
+    listening: bool,
+    theme: Theme,
+    content_x: int,
+    content_w: int,
+    height: int,
+) -> None:
+    """One line under the camera view. Hidden unless the user is typing or recording."""
+    if draft is None and not listening:
+        return
+    bar_h = 22 if height >= 80 else 12
+    margin = 8 if height >= 80 else 2
+    y1 = max(bar_h + 1, height - (28 if height >= 80 else 16))
+    y0 = y1 - bar_h
+    x0 = max(0, content_x + margin)
+    x1 = min(image.shape[1] - 1, content_x + content_w - margin)
+    if x1 - x0 < 16 or y0 < 0 or y1 > image.shape[0]:
+        return
+    fill = hex_to_bgr(theme.colors.get("background", "#001018"))
+    border = hex_to_bgr(theme.colors.get("primary", "#FFFFFF"))
+    cv2.rectangle(image, (x0, y0), (x1, y1), fill, -1)
+    cv2.rectangle(image, (x0, y0), (x1, y1), border, 1)
+    if listening and draft is None:
+        label = "Listening... press V to send"
+    else:
+        label = f"Ask Gemma: {draft}_"
+    max_chars = max(8, (x1 - x0 - 8) // 7)
+    if len(label) > max_chars:
+        label = label[: max_chars - 1] + "_"
+    cv2.putText(
+        image,
+        label,
+        (x0 + 4, min(image.shape[0] - 2, y1 - 6)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4 if height >= 80 else 0.3,
+        border,
+        1,
+        cv2.LINE_8,
+    )
+
+
 def _draw_bullets(
     image: np.ndarray,
     panel: WidgetBox,
@@ -152,6 +236,7 @@ def _draw_bullets(
     bullets: list[tuple[str, float]],
     theme: Theme,
     insights: list[tuple[str, float]],
+    ask_rows: list[str],
 ) -> None:
     text_color = hex_to_bgr(theme.colors.get("text", "#FFFFFF"))
     font = (
@@ -165,6 +250,28 @@ def _draw_bullets(
     y = avatar_box.y + avatar_box.h + line_h
     _badge_x, badge_y, _badge_w, _badge_h = coaching_badge_rect(panel)
     bottom = min(panel.y + panel.h - 6, badge_y - 4)
+    max_chars = max(12, (panel.w - 16) // 7)
+    label_color = hex_to_bgr(theme.colors.get("primary", "#FFFFFF"))
+    for row in ask_rows:
+        if y > bottom:
+            break
+        shown = row if len(row) <= max_chars else row[: max_chars - 3] + "..."
+        color = (
+            label_color
+            if row in {"ASK", "LISTENING..."} or row.startswith("THINKING")
+            else text_color
+        )
+        cv2.putText(
+            image,
+            shown,
+            (x, y),
+            font,
+            scale,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        y += line_h
     for text, alpha in bullets:
         if y > bottom:
             break

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -10,16 +11,23 @@ import numpy as np
 
 from src.audio.audio_feedback import AudioOutput, chime_for_cue
 from src.audio.pace_analyzer import PaceAnalyzer
+from src.audio.speech_transcriber import (
+    SpokenRequest,
+    load_transcriber,
+    prepare_spoken_ask,
+)
 from src.audio.volume_analyzer import VolumeAnalyzer
 from src.capture.audio_stream import AudioCaptureError, MicrophoneStream
 from src.capture.video_stream import CameraUnavailable, FileVideoSource, WebcamSource
 from src.config_loader import REPO_ROOT, AppConfig, load_config
 from src.controls.session_control import SessionControl
 from src.demo_scene import DemoScene
+from src.hud.ask_input import AskComposer, SpeechRecorder, dispatch_preview_key
 from src.hud.display import detect_screen_size, prepare_display_frame
 from src.hud.renderer import HudRenderer, HudState, PreviewWindow
 from src.intelligence.gemma_client import (
     CoachMetrics,
+    CoachWindow,
     GemmaClient,
     active_cues,
     offline_insights,
@@ -50,6 +58,7 @@ class RunOptions:
     chimes: bool = False
     offline: bool = False
     download_models: bool = False
+    ask: str | None = None
 
 
 @dataclass
@@ -132,6 +141,16 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         action="store_true",
         help="Download MediaPipe .task models into models/ and exit",
     )
+    parser.add_argument(
+        "--ask",
+        nargs="?",
+        const="-",
+        default=None,
+        help=(
+            "Ask Gemma one question, print the reply, and exit. "
+            'Pass "-" or omit the text to read one line from stdin.'
+        ),
+    )
     args = parser.parse_args(argv)
     demo = bool(args.demo or (args.camera is None and args.video is None))
     if args.camera is not None or args.video is not None:
@@ -152,7 +171,62 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         chimes=args.chimes,
         offline=args.offline,
         download_models=args.download_models,
+        ask=args.ask,
     )
+
+
+def format_ask_output(question: str, lines: list[str]) -> str:
+    body = "\n".join(f"ASK: {line}" for line in lines)
+    return f"YOU: {question}\n{body}"
+
+
+def perform_ask(
+    question: str,
+    client: GemmaClient | None = None,
+    config: AppConfig | None = None,
+    offline: bool = False,
+) -> tuple[int, str]:
+    """Blocking one-shot used by ``--ask``. Does not open a window or a camera."""
+    app_config = config or load_config()
+    owns_client = client is None
+    if client is None:
+        client = GemmaClient.from_env(
+            model=app_config.gemma.model,
+            duration_ms=app_config.cues.duration_ms,
+            offline=offline,
+            min_interval=app_config.gemma.min_interval_seconds,
+            timeout=app_config.gemma.timeout_seconds,
+            report_timeout=app_config.gemma.report_timeout_seconds,
+            max_output_tokens=app_config.gemma.max_output_tokens,
+        )
+    try:
+        lines, ok = client.ask_blocking(question, CoachWindow())
+    finally:
+        if owns_client:
+            client.close()
+    return (0 if ok else 1), format_ask_output(question, lines)
+
+
+def deliver_spoken_ask(
+    samples: np.ndarray,
+    sample_rate: int,
+    client: GemmaClient,
+    window: CoachWindow,
+    now: float,
+    transcriber,
+) -> SpokenRequest:
+    """Transcribe or attach audio, then start an ask. Notices never block."""
+    request = prepare_spoken_ask(samples, sample_rate, client.model, transcriber)
+    if request.kind == "notice":
+        client.note_local([request.text])
+        return request
+    client.ask(
+        request.text,
+        window,
+        now,
+        audio=request.audio if request.kind == "audio" else None,
+    )
+    return request
 
 
 def format_summary(summary: RunSummary) -> str:
@@ -186,6 +260,7 @@ def run_session(
     options: RunOptions,
     config: AppConfig | None = None,
     client: GemmaClient | None = None,
+    transcriber=None,
 ) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
@@ -257,6 +332,10 @@ def run_session(
     )
     gestures = GestureDetector()
     stats = SessionStats(window_seconds=45.0)
+    composer = AskComposer()
+    recorder = SpeechRecorder()
+    speech = transcriber
+    speech_ready = transcriber is not None
     if client is None:
         client = GemmaClient.from_env(
             model=app_config.gemma.model,
@@ -330,6 +409,20 @@ def run_session(
     audio_cursor = 0
     frame_index = 0
     pace_clock = time.perf_counter()
+
+    def _ensure_speech():
+        nonlocal speech, speech_ready
+        if not speech_ready:
+            speech = load_transcriber()
+            speech_ready = True
+        return speech
+
+    def _send_speech(at: float) -> None:
+        samples, rate = recorder.take()
+        deliver_spoken_ask(
+            samples, rate, client, stats.recent(at), at, _ensure_speech()
+        )
+
     try:
         while frame_limit is None or frame_index < frame_limit:
             timestamp = frame_index / fps
@@ -371,6 +464,8 @@ def run_session(
                     audio = microphone.pop_ready().samples
                 else:
                     audio = np.zeros(max(1, int(sample_rate / fps)), dtype=np.float32)
+                if recorder.active and recorder.add(audio, sample_rate):
+                    _send_speech(timestamp)
                 if preview is not None and (frame.shape[1], frame.shape[0]) != (
                     target_w,
                     target_h,
@@ -464,6 +559,17 @@ def run_session(
             else:
                 insight_lines = offline_insights(stats.recent(timestamp))
             renderer.sidebar.push_insights(insight_lines, timestamp)
+            if recorder.active:
+                renderer.sidebar.show_ask("", "listening", [], time.monotonic())
+            else:
+                ask_state = client.ask_state
+                if ask_state.phase != "idle":
+                    renderer.sidebar.show_ask(
+                        ask_state.question,
+                        ask_state.phase,
+                        list(ask_state.lines),
+                        ask_state.started,
+                    )
 
             remaining = max(0.0, timer_seconds - timestamp)
             ratio = remaining / timer_seconds if timer_seconds else 0.0
@@ -478,6 +584,8 @@ def run_session(
                     pulse_t=timestamp,
                     coaching_status=client.status,
                     level_threshold_db=control.effective_speak_up_db(),
+                    ask_draft=composer.text if composer.open else None,
+                    listening=recorder.active,
                 ),
             )
             if summary.first_frame is None:
@@ -491,17 +599,24 @@ def run_session(
             summary.theme = control.theme_name
 
             if preview is not None:
+                preview.text_entry = composer.open
                 key = preview.show(rendered)
-                if key == "quit":
+                dispatched = dispatch_preview_key(key, composer, control, timestamp)
+                if dispatched.quit:
                     break
-                if key in {"fullscreen", "exit_fullscreen"}:
-                    key = None
-                if key:
-                    action = control.handle_key(key, timestamp)
-                    if action == "quit":
-                        break
-                    if action:
-                        summary.actions.append((timestamp, action))
+                if dispatched.submitted:
+                    client.ask(dispatched.submitted, stats.recent(timestamp), timestamp)
+                    if recorder.active:
+                        recorder.take()
+                elif dispatched.speech_toggle:
+                    if microphone is None:
+                        client.note_local(
+                            ["Speech ask needs a microphone. Type with G."]
+                        )
+                    elif recorder.toggle() == "stop":
+                        _send_speech(timestamp)
+                elif dispatched.action:
+                    summary.actions.append((timestamp, dispatched.action))
                     if control.theme_name != renderer.theme.key:
                         renderer.set_theme(app_config.theme(control.theme_name))
             if scene is not None and (
@@ -562,6 +677,15 @@ def _start_playback(
 
 def main(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
+    if options.ask is not None:
+        question = sys.stdin.readline() if options.ask == "-" else options.ask
+        question = question.strip()
+        if not question:
+            print("Type a question for Gemma.")
+            return 1
+        code, text = perform_ask(question, offline=options.offline)
+        print(text)
+        return code
     if options.download_models:
         summary = run_session(options)
         print(format_summary(summary))

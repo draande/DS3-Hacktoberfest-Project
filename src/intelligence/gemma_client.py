@@ -204,6 +204,29 @@ def build_prompt(window: CoachWindow) -> str:
     return build_insight_prompt(window)
 
 
+def model_accepts_inline_audio(model: str) -> bool:
+    """True only for Gemma 4 sizes whose model card lists audio input.
+
+    ``google-genai`` can attach an inline ``audio/wav`` part, but
+    ``gemma-4-26b-a4b-it`` and ``gemma-4-31b-it`` reject it with
+    "Audio input modality is not enabled for this model". Audio is
+    documented for E2B, E4B, and 12B only.
+    """
+    name = (model or "").lower().replace("_", "-")
+    if any(token in name for token in ("26b", "31b", "a4b")):
+        return False
+    return any(token in name for token in ("e2b", "e4b", "12b"))
+
+
+def build_ask_prompt(question: str, window: CoachWindow) -> str:
+    """The user's question plus the same compact metric line as an insight."""
+    question = " ".join(str(question or "").split())
+    return (
+        'JSON {"lines":["short answer"]}. 1-3 lines. Answer the question.\n'
+        f"Q: {question}\n" + _metric_line(window)
+    )
+
+
 def extract_json_object(text: str | None) -> dict | None:
     """Parse the first JSON object, including one wrapped in a ```json fence."""
     if not text:
@@ -244,6 +267,47 @@ def parse_insight_json(text: str | None) -> list[str] | None:
         return None
     bullets = normalize_bullets(data.get("bullets"))[:3]
     return bullets or None
+
+
+def _short_answer_lines(value, limit: int = 3, words: int = 14) -> list[str]:
+    """Keep a direct reply readable. Do not pad one-word answers."""
+    if isinstance(value, str):
+        parts = [line.strip() for line in value.splitlines()]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(item).strip() for item in value]
+    else:
+        return []
+    lines: list[str] = []
+    for part in parts:
+        cleaned = " ".join(part.replace("•", " ").split())
+        while cleaned[:1] in {"-", "*"}:
+            cleaned = cleaned[1:].strip()
+        if not cleaned:
+            continue
+        clipped = " ".join(cleaned.split()[:words])
+        if clipped not in lines:
+            lines.append(clipped)
+        if len(lines) == limit:
+            break
+    return lines
+
+
+def parse_ask_reply(text: str | None) -> list[str] | None:
+    """1–3 short lines from JSON ``lines`` or ``bullets``, or from plain text."""
+    data = extract_json_object(text)
+    if data is not None:
+        raw = data.get("lines")
+        if raw is None:
+            raw = data.get("bullets")
+        return _short_answer_lines(raw) or None
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    if not cleaned or cleaned.startswith("{"):
+        return None
+    return _short_answer_lines(cleaned) or None
 
 
 def _report_lines(value, limit: int = 3) -> list[str]:
@@ -444,6 +508,31 @@ def _is_backoff(exc: BaseException) -> bool:
     return "429" in text or "504" in text or "deadline_exceeded" in text
 
 
+def ask_error_line(exc: BaseException) -> str:
+    """One sidebar line. The log still keeps the raw status text."""
+    text = format_gemma_error(exc).lower()
+    code = getattr(exc, "code", None)
+    if code is None:
+        code = getattr(exc, "status_code", None)
+    if code == 429 or "429" in text:
+        return "Gemma is busy. Try again."
+    if code == 504 or "504" in text or "deadline_exceeded" in text:
+        return "Gemma timed out. Try again."
+    if isinstance(exc, TimeoutError) or "timed out" in text:
+        return "Timed out. Try again."
+    return "Gemma could not answer."
+
+
+@dataclass
+class AskState:
+    """What the sidebar shows for a direct question. Idle until the user asks."""
+
+    question: str = ""
+    phase: str = "idle"
+    lines: tuple[str, ...] = ()
+    started: float = 0.0
+
+
 class GemmaClient:
     """Background insight client. Real-time cues never come from here.
 
@@ -491,6 +580,8 @@ class GemmaClient:
         self._job_id = 0
         self._settled: set[int] = set()
         self._closed = False
+        self._skip_next_insight = False
+        self._ask = AskState()
 
     @classmethod
     def from_env(
@@ -548,6 +639,14 @@ class GemmaClient:
             return list(self._bullets)
 
     @property
+    def ask_state(self) -> AskState:
+        with self._lock:
+            state = self._ask
+            return AskState(
+                state.question, state.phase, tuple(state.lines), state.started
+            )
+
+    @property
     def average_latency(self) -> float | None:
         with self._lock:
             if not self._latencies:
@@ -580,6 +679,111 @@ class GemmaClient:
         if not live:
             return None
         return bullets
+
+    def ask(
+        self,
+        question: str,
+        window: CoachWindow,
+        now: float | None = None,
+        audio: bytes | None = None,
+    ) -> None:
+        """Start a direct question and return immediately.
+
+        Drops an in-flight insight or ask so only the newest result is applied,
+        and skips the next scheduled insight. The frame loop must not join this.
+        """
+        question = " ".join(str(question or "").split())
+        if audio is not None and not model_accepts_inline_audio(self.model):
+            audio = None
+        if not question and not audio:
+            return
+        stamp = time.monotonic()
+        when = stamp if now is None else float(now)
+        shown = question or "Voice question"
+        if self.offline or (self.transport is None and not self.api_key):
+            with self._lock:
+                self._skip_next_insight = True
+                self._ask = AskState(
+                    question=shown,
+                    phase="error",
+                    lines=("Gemma is offline.",),
+                    started=stamp,
+                )
+            return
+        prompt = build_ask_prompt(
+            question or "What did I just ask? Answer in 1-3 short lines.",
+            window,
+        )
+        with self._lock:
+            if self._closed:
+                return
+            self._job_id += 1
+            job_id = self._job_id
+            self._pending = True
+            self._last_submit = when
+            self._skip_next_insight = True
+            self._ask = AskState(question=shown, phase="thinking", started=stamp)
+        threading.Thread(
+            target=self._ask_worker,
+            args=(prompt, audio, job_id),
+            name="wingman-gemma-ask",
+            daemon=True,
+        ).start()
+
+    def note_local(self, lines: list[str], question: str = "") -> None:
+        """Sidebar message that does not call Gemma. Typed asks stay available."""
+        shown = tuple(line for line in lines if str(line).strip())
+        if not shown:
+            return
+        with self._lock:
+            self._ask = AskState(
+                question=" ".join(question.split()),
+                phase="error",
+                lines=shown[:3],
+                started=time.monotonic(),
+            )
+
+    def ask_blocking(
+        self, question: str, window: CoachWindow | None = None
+    ) -> tuple[list[str], bool]:
+        """One-shot ask for ``--ask``. Waits, but the frame loop never calls this."""
+        window = window or CoachWindow()
+        question = " ".join(str(question or "").split())
+        if not question:
+            return ["Type a question for Gemma."], False
+        if self.offline or (self.transport is None and not self.api_key):
+            return ["Gemma is offline."], False
+        prompt = build_ask_prompt(question, window)
+        done = threading.Event()
+        box: dict = {}
+
+        def invoke() -> None:
+            try:
+                box["text"] = self._fetch(prompt)
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        started = time.perf_counter()
+        threading.Thread(
+            target=invoke, name="wingman-gemma-ask-once", daemon=True
+        ).start()
+        if not done.wait(self.timeout):
+            exc = TimeoutError(f"timed out after {self.timeout:.1f}s")
+            self._note_failure(exc, latency=time.perf_counter() - started)
+            return [ask_error_line(exc)], False
+        latency = time.perf_counter() - started
+        if "error" in box:
+            self._note_failure(box["error"], latency=latency)
+            return [ask_error_line(box["error"])], False
+        lines = parse_ask_reply(box.get("text"))
+        if not lines:
+            exc = ValueError("unparseable Gemma response")
+            self._note_failure(exc, latency=latency)
+            return [ask_error_line(exc)], False
+        self._note_success(None, latency=latency)
+        return lines, True
 
     def report(self, window: CoachWindow) -> tuple[str, list[str], list[str]]:
         """One end-of-session call. Falls back locally if Gemma does not answer.
@@ -639,6 +843,10 @@ class GemmaClient:
         with self._lock:
             if self._closed or self._pending:
                 return
+            if self._skip_next_insight:
+                self._skip_next_insight = False
+                self._last_submit = now
+                return
             if (
                 self._last_submit is not None
                 and now - self._last_submit < self._wait_seconds()
@@ -688,16 +896,109 @@ class GemmaClient:
             if self._job_id == job_id:
                 self._pending = False
 
+    def _ask_worker(self, prompt: str, audio: bytes | None, job_id: int) -> None:
+        done = threading.Event()
+        box: dict = {}
+
+        def invoke() -> None:
+            try:
+                box["text"] = self._fetch(prompt, audio)
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        started = time.perf_counter()
+        threading.Thread(
+            target=invoke, name="wingman-gemma-ask-call", daemon=True
+        ).start()
+        if not done.wait(self.timeout):
+            self._finish_ask(
+                job_id,
+                error=TimeoutError(f"timed out after {self.timeout:.1f}s"),
+                latency=time.perf_counter() - started,
+            )
+            return
+        latency = time.perf_counter() - started
+        if "error" in box:
+            self._finish_ask(job_id, error=box["error"], latency=latency)
+            return
+        lines = parse_ask_reply(box.get("text"))
+        if not lines:
+            self._finish_ask(
+                job_id,
+                error=ValueError("unparseable Gemma response"),
+                latency=latency,
+            )
+            return
+        self._finish_ask(job_id, lines=lines, latency=latency)
+
+    def _finish_ask(
+        self,
+        job_id: int,
+        lines: list[str] | None = None,
+        error: BaseException | None = None,
+        latency: float | None = None,
+    ) -> None:
+        line = None if error is None else format_gemma_error(error)
+        retryable = error is not None and _is_backoff(error)
+        fresh = False
+        with self._lock:
+            if not self._claim(job_id):
+                return
+            if latency is not None:
+                self._latencies.append(float(latency))
+                logger.info("Gemma call took %.2fs", latency)
+            if error is None:
+                self._succeeded += 1
+                self._live = True
+                self._penalty = 0.0
+                self.used_fallback = False
+                self._ask = AskState(
+                    question=self._ask.question,
+                    phase="reply",
+                    lines=tuple(lines or ()),
+                    started=self._ask.started,
+                )
+            else:
+                self._failed += 1
+                if retryable:
+                    if self._penalty <= 0:
+                        self._penalty = self.min_interval
+                    else:
+                        self._penalty = min(180.0, self._penalty * 2)
+                fresh = line not in self._seen_errors
+                if fresh and line is not None:
+                    self._seen_errors.add(line)
+                self._ask = AskState(
+                    question=self._ask.question,
+                    phase="error",
+                    lines=(ask_error_line(error),),
+                    started=self._ask.started,
+                )
+            if self._job_id == job_id:
+                self._pending = False
+        if fresh and line:
+            logger.warning("Gemma call failed: %s", line)
+
     def _evaluate(self, window: CoachWindow) -> list[str]:
         parsed = parse_insight_json(self._fetch(build_insight_prompt(window)))
         if not parsed:
             raise ValueError("unparseable Gemma response")
         return parsed
 
-    def _fetch(self, prompt: str) -> str:
+    def _fetch(self, prompt: str, audio: bytes | None = None) -> str:
         if self.transport is not None:
-            return self.transport(prompt)
-        return self._call_google(prompt)
+            if audio is None:
+                return self.transport(prompt)
+            try:
+                return self.transport(prompt, audio)
+            except TypeError as exc:
+                message = str(exc)
+                if "argument" not in message and "positional" not in message:
+                    raise
+                return self.transport(prompt)
+        return self._call_google(prompt, audio)
 
     def _note_success(
         self,
@@ -754,7 +1055,7 @@ class GemmaClient:
         self._settled.add(job_id)
         return True
 
-    def _call_google(self, prompt: str) -> str:
+    def _call_google(self, prompt: str, audio: bytes | None = None) -> str:
         from google import genai
         from google.genai import types
 
@@ -762,9 +1063,15 @@ class GemmaClient:
             api_key=self.api_key,
             http_options=types.HttpOptions(timeout=http_timeout_ms(self.timeout)),
         )
+        contents: str | list = prompt
+        if audio and model_accepts_inline_audio(self.model):
+            contents = [
+                prompt,
+                types.Part.from_bytes(data=audio, mime_type="audio/wav"),
+            ]
         response = client.models.generate_content(
             model=self.model,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(
                 max_output_tokens=self.max_output_tokens
             ),

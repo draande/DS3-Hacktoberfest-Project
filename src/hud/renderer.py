@@ -14,7 +14,7 @@ import numpy as np
 from src.config_loader import AvatarConfig, SidebarConfig, Theme
 from src.hud.avatar import AvatarState, AvatarWidget
 from src.hud.display import configure_preview_window
-from src.hud.sidebar import FeedbackSidebar, draw_sidebar
+from src.hud.sidebar import FeedbackSidebar, draw_ask_bar, draw_sidebar
 from src.hud.vignette import apply_vignette
 from src.hud.widgets import (
     draw_mic_meter,
@@ -35,6 +35,8 @@ class HudState:
     pulse_t: float = 0.0
     coaching_status: str = "offline"
     level_threshold_db: float = 42.0
+    ask_draft: str | None = None
+    listening: bool = False
 
 
 class HudRenderer:
@@ -117,6 +119,22 @@ class HudRenderer:
             self.avatar_widget,
             coaching_status=state.coaching_status,
             insights=self.sidebar.visible_insights(state.pulse_t),
+            ask_rows=self.sidebar.visible_ask(),
+        )
+        if self.sidebar_config.side == "left":
+            content_x = panel.x + panel.w
+            content_w = max(1, canvas.shape[1] - content_x)
+        else:
+            content_x = 0
+            content_w = max(1, panel.x)
+        draw_ask_bar(
+            canvas,
+            state.ask_draft,
+            state.listening,
+            self.theme,
+            content_x,
+            content_w,
+            canvas.shape[0],
         )
         if self.opacity >= 0.999:
             return canvas
@@ -150,6 +168,7 @@ class PreviewWindow:
         self._pygame = None
         self._screen = None
         self._applied: tuple[bool, tuple[int, int]] | None = None
+        self.text_entry = False
 
     def target_size(self) -> tuple[int, int]:
         if self.fullscreen and self.screen_size is not None:
@@ -201,7 +220,10 @@ class PreviewWindow:
                 self._cv2.WINDOW_FULLSCREEN,
             )
         key = self._cv2.waitKey(1) & 0xFF
-        return self.interpret_key(_key_name(key))
+        raw = _key_name(key)
+        if self.text_entry:
+            return raw
+        return self.interpret_key(raw)
 
     def _show_pygame(self, frame: np.ndarray) -> str | None:
         # Set before importing pygame. SDL reads the driver when the mixer
@@ -233,6 +255,8 @@ class PreviewWindow:
             if event.type == pygame.QUIT:
                 return "quit"
             if event.type == pygame.KEYDOWN:
+                if self.text_entry:
+                    return _pygame_text_key(event)
                 return self.interpret_key(pygame.key.name(event.key))
         return None
 
@@ -247,21 +271,32 @@ class PreviewWindow:
 
 
 def _key_name(key: int) -> str | None:
-    if key in (255, -1):
+    if key in (255, -1, 0):
         return None
-    mapping = {
-        32: "space",
-        13: "enter",
-        27: "escape",
-        ord("q"): "q",
-        ord("f"): "f",
-        ord("t"): "t",
-        ord("m"): "m",
-        ord("s"): "s",
-        ord("["): "[",
-        ord("]"): "]",
-        ord("+"): "+",
-        ord("-"): "-",
-        ord("="): "=",
-    }
-    return mapping.get(key)
+    if key in (8, 127):
+        return "backspace"
+    if key in (10, 13):
+        return "enter"
+    if key == 27:
+        return "escape"
+    if key == 32:
+        return "space"
+    if 33 <= key <= 126:
+        return chr(key).lower()
+    return None
+
+
+def _pygame_text_key(event) -> str | None:
+    """Character for the ask bar. Shortcuts are not interpreted while it is open."""
+    import pygame
+
+    if event.key == pygame.K_BACKSPACE:
+        return "backspace"
+    if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+        return "enter"
+    if event.key == pygame.K_ESCAPE:
+        return "escape"
+    symbol = event.unicode or ""
+    if symbol and symbol.isprintable():
+        return symbol
+    return pygame.key.name(event.key)

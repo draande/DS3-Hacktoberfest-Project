@@ -124,6 +124,36 @@ def test_show_escape_leaves_fullscreen_before_a_second_escape_quits():
     assert window.show(frame) == "quit"
 
 
+def test_text_entry_returns_letters_and_escape_without_quitting():
+    fake = FakeCv2(key=ord("g"))
+    window = PreviewWindow(
+        screen_size=(200, 100),
+        windowed_size=(80, 40),
+        fullscreen=False,
+        cv2_module=fake,
+    )
+    frame = np.zeros((40, 80, 3), np.uint8)
+    assert window.show(frame) == "g"
+    window.text_entry = True
+    fake.key = ord("m")
+    assert window.show(frame) == "m"
+    assert window.fullscreen is False
+    fake.key = ord("f")
+    assert window.show(frame) == "f"
+    assert window.fullscreen is False
+    fake.key = 27
+    assert window.show(frame) == "escape"
+    fake.key = 8
+    assert window.show(frame) == "backspace"
+    fake.key = ord("?")
+    assert window.show(frame) == "?"
+    window.text_entry = False
+    fake.key = ord("v")
+    assert window.show(frame) == "v"
+    fake.key = 27
+    assert window.show(frame) == "quit"
+
+
 def test_detect_screen_size_does_not_crash_without_a_display():
     size = detect_screen_size()
     assert size is None or (size[0] > 0 and size[1] > 0)

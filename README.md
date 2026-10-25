@@ -27,6 +27,8 @@ uv run python main.py --demo --display                 # borderless fullscreen p
 uv run python main.py --demo --timer 20 --display          # preview the edge vignette
 uv run python main.py --demo --theme minimalist
 uv run python main.py --offline                            # ignore a Gemma API key
+uv run python main.py --ask "how's my pacing?"             # one question, then exit
+uv run python main.py --ask                                # read one line from stdin, then exit
 ```
 
 `--timer 20` shortens the presentation clock so the border glow moves from clear, to amber under 25% remaining, to red under 10%. The config default is a 5 minute talk.
@@ -56,7 +58,19 @@ Each insight call sends a compact summary of the last 45 seconds (cue counts, av
 
 The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `GEMMA` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
 
-When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on either call. The test suite clears the key and model variables and uses fake transports.
+Press `G` in the preview to ask Gemma something directly ("say hello", "how's my pacing?"). A one-line bar opens on the HUD, Enter sends, and Esc cancels. The frame loop keeps running, and keys typed into the bar do not fire other shortcuts. `F`, Esc, and `Q` behave as before when the bar is closed. The question is sent with the same compact recent-metrics line as an insight, and the reply is 1–3 short lines. An ask replaces any in-flight Gemma call and skips the next scheduled insight, so only one call is applied at a time. The sidebar shows `YOU: ...`, then `THINKING...` with the elapsed seconds (a reply often takes 15–25 seconds because of hidden thinking tokens), then the reply under `ASK`. That block stays up until the next ask. A timeout, 429, or 504 becomes one short error line.
+
+Without a window, `--ask "text"` prints the reply and exits. `--ask` with no text, or `--ask -`, reads one line from stdin. That path does not open the camera.
+
+`V` toggles push-to-talk on the microphone that is already open (press to start, press again to send, or it sends itself after 30 seconds). OpenCV only reports key presses, so this is a toggle rather than a hold. Gemma 4 E2B, E4B, and 12B accept inline audio, and those models get the wav directly. The default `gemma-4-26b-a4b-it` and `gemma-4-31b-it` do not (`Audio input modality is not enabled`), so speech is transcribed locally first. `faster-whisper` (tiny or base, CPU) is an optional dependency:
+
+```bash
+uv sync --group stt
+```
+
+If it is not installed, the sidebar says so and typed asks keep working. `run_session(..., transcriber=...)` accepts any object with `transcribe(samples, sample_rate)`, so another transcriber can be swapped in without changing the ask path. The demo has no microphone; `V` there asks you to type with `G`.
+
+When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on an insight, an ask, or the final report. The test suite clears the key and model variables and uses fake transports.
 
 ## Hotkeys
 
@@ -71,6 +85,8 @@ Shown while a preview window is open (`--display`):
 | S | Snooze every cue for 30 seconds |
 | M | Switch between Ironman and Minimalist |
 | `[` / `]` | More sensitive / less sensitive coaching thresholds |
+| G | Open a one-line ask. Enter sends it, Esc cancels, and typed keys stay in the bar |
+| V | Start or stop a spoken ask on the live microphone |
 
 Gestures, from hand landmarks:
 
