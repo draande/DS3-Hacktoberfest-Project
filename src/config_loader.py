@@ -108,7 +108,20 @@ class AudioStreamConfig:
 
 
 @dataclasses.dataclass
+class InsightConfig:
+    """Fast periodic trends. Separate from the slow Gemma client."""
+
+    model: str = "gemini-3.5-flash-lite"
+    min_interval_seconds: float = 8.0
+    timeout_seconds: float = 10.0
+    max_output_tokens: int = 256
+    thinking_level: str = "minimal"
+
+
+@dataclasses.dataclass
 class GemmaConfig:
+    """Slow report and Ask Gemma settings. The insight loop does not read these."""
+
     model: str = "gemma-4-26b-a4b-it"
     min_interval_seconds: float = 18.0
     timeout_seconds: float = 45.0
@@ -137,6 +150,7 @@ class AppConfig:
     cues: CueConfig = dataclasses.field(default_factory=CueConfig)
     hud: HudConfig = dataclasses.field(default_factory=HudConfig)
     audio: AudioStreamConfig = dataclasses.field(default_factory=AudioStreamConfig)
+    insight: InsightConfig = dataclasses.field(default_factory=InsightConfig)
     gemma: GemmaConfig = dataclasses.field(default_factory=GemmaConfig)
     themes: dict[str, Theme] = dataclasses.field(default_factory=dict)
 
@@ -219,6 +233,22 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("hud.sidebar.fade_seconds cannot be negative")
     if float(config.hud.sidebar.fade_seconds) >= float(config.hud.sidebar.ttl_seconds):
         raise ValueError("hud.sidebar.fade_seconds must be shorter than ttl_seconds")
+    if float(config.insight.min_interval_seconds) <= 0:
+        raise ValueError("insight.min_interval_seconds must be positive")
+    if float(config.insight.timeout_seconds) < 10:
+        raise ValueError(
+            "insight.timeout_seconds must be at least 10 seconds; "
+            "shorter deadlines are rejected by the API"
+        )
+    if int(config.insight.max_output_tokens) < 32:
+        raise ValueError("insight.max_output_tokens must be at least 32")
+    if str(config.insight.thinking_level).lower() not in {
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    }:
+        raise ValueError("insight.thinking_level must be minimal, low, medium, or high")
     if float(config.gemma.min_interval_seconds) <= 0:
         raise ValueError("gemma.min_interval_seconds must be positive")
     if float(config.gemma.timeout_seconds) < 10:

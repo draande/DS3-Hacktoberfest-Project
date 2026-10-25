@@ -69,11 +69,16 @@ class FeedbackSidebar:
         return shown
 
 
-BADGE_LABELS = {"gemma": "GEMMA", "thinking": "THINKING", "offline": "OFFLINE"}
+BADGE_LABELS = {
+    "flash": "FLASH",
+    "gemma": "FLASH",
+    "thinking": "THINKING",
+    "offline": "OFFLINE",
+}
 
 
 def coaching_badge_rect(panel: WidgetBox) -> tuple[int, int, int, int]:
-    """Small strip at the bottom of the sidebar for the Gemma status."""
+    """Small strip at the bottom of the sidebar for the insight-model status."""
     height = 16 if panel.h >= 40 else max(4, panel.h // 5)
     height = min(height, max(1, panel.h))
     inset = 2 if panel.w > 8 else 0
@@ -226,7 +231,12 @@ def _draw_coaching_badge(
     if x1 <= x0 or y1 <= y0:
         return
     kind = status if status in BADGE_LABELS else "offline"
-    role = {"gemma": "primary", "thinking": "warning", "offline": "neutral"}[kind]
+    role = {
+        "flash": "primary",
+        "gemma": "primary",
+        "thinking": "warning",
+        "offline": "neutral",
+    }[kind]
     color = hex_to_bgr(theme.colors.get(role, "#7A8B99"))
     cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), color, -1)
     if height < 12 or width < 36:

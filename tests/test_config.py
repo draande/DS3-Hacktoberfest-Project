@@ -24,6 +24,11 @@ def test_default_config_loads_plan_thresholds():
     assert config.timer.duration_seconds == 300
     assert config.audio.sample_rate == 16000
     assert config.hud.fps == 30
+    assert config.insight.model == "gemini-3.5-flash-lite"
+    assert config.insight.min_interval_seconds == 8
+    assert config.insight.timeout_seconds == 10
+    assert config.insight.max_output_tokens == 256
+    assert config.insight.thinking_level == "minimal"
     assert config.gemma.model == "gemma-4-26b-a4b-it"
     assert config.gemma.min_interval_seconds == 18
     assert config.gemma.timeout_seconds == 45
@@ -91,6 +96,20 @@ def test_gemma_timeout_under_ten_seconds_is_rejected(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("gemma:\n  timeout_seconds: 8\n", encoding="utf-8")
     with pytest.raises(ValueError, match="at least 10"):
+        load_config(config_path)
+
+
+def test_insight_timeout_under_ten_seconds_is_rejected(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("insight:\n  timeout_seconds: 8\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="insight.timeout_seconds"):
+        load_config(config_path)
+
+
+def test_unknown_thinking_level_is_rejected(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("insight:\n  thinking_level: huge\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="thinking_level"):
         load_config(config_path)
 
 

@@ -3,7 +3,7 @@ import time
 import numpy as np
 
 from main import main
-from src.intelligence.gemma_client import GemmaClient
+from src.intelligence.insight_client import InsightClient
 from src.main import RunSummary, format_summary, parse_args, run_session
 
 
@@ -28,11 +28,25 @@ def test_main_banner_and_short_headless_demo(capsys):
     assert "coaching=offline" in captured.out
 
 
-def test_summary_reports_gemma_success_and_failure_counts():
-    text = format_summary(RunSummary(fallback=False, gemma_ok=2, gemma_failed=1))
-    assert "coaching=gemma" in text
-    assert "gemma_ok=2" in text
-    assert "gemma_failed=1" in text
+def test_summary_reports_each_model_separately():
+    text = format_summary(
+        RunSummary(
+            fallback=False,
+            insight_ok=2,
+            insight_failed=1,
+            insight_avg=1.5,
+            gemma_ok=1,
+            gemma_failed=0,
+            gemma_avg=21.0,
+        )
+    )
+    assert "coaching=flash" in text
+    assert "insight_ok=2" in text
+    assert "insight_failed=1" in text
+    assert "insight_avg=1.5s" in text
+    assert "gemma_ok=1" in text
+    assert "gemma_failed=0" in text
+    assert "gemma_avg=21.0s" in text
 
 
 def test_demo_loop_does_not_wait_for_a_slow_gemma_call():
@@ -43,12 +57,11 @@ def test_demo_loop_does_not_wait_for_a_slow_gemma_call():
             '"icon":"ok","duration_ms":2000,"audio_chime":false}'
         )
 
-    client = GemmaClient(
+    client = InsightClient(
         api_key="test-key",
         transport=slow,
         min_interval=2.5,
         timeout=5,
-        report_timeout=0,
     )
     started = time.perf_counter()
     summary = run_session(

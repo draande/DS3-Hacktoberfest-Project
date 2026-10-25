@@ -233,7 +233,7 @@ def test_renderer_paints_the_sidebar_for_both_themes():
         assert int(strip.max()) > 0
 
 
-def test_coaching_badge_switches_between_gemma_thinking_and_offline():
+def test_coaching_badge_switches_between_flash_thinking_and_offline():
     config = load_config()
     theme = config.theme("ironman")
     renderer = HudRenderer(
@@ -246,7 +246,7 @@ def test_coaching_badge_switches_between_gemma_thinking_and_offline():
     kwargs = dict(
         remaining_seconds=10, remaining_ratio=0.8, cue=None, volume_db=50, wpm=140
     )
-    live = renderer.render(frame.copy(), HudState(**kwargs, coaching_status="gemma"))
+    live = renderer.render(frame.copy(), HudState(**kwargs, coaching_status="flash"))
     thinking = renderer.render(
         frame.copy(), HudState(**kwargs, coaching_status="thinking")
     )

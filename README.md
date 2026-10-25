@@ -50,11 +50,13 @@ Posture, volume, pace, and gaze are decided on the device every frame. If severa
 
 ## Gemma
 
-Gemma writes two slow things: a trend every `gemma.min_interval_seconds` (18s) and a short report when the session ends. The default model is `gemma-4-26b-a4b-it`. `GEMMA_MODEL` overrides `gemma.model`. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable it. With no key, the same slots are filled locally and nothing is sent over the network.
+Two models, used separately. The periodic trend uses `insight.model` (`gemini-3.5-flash-lite`). `INSIGHT_MODEL` overrides it. That call sets thinking to `minimal`, asks for JSON, and caps the reply at `insight.max_output_tokens` (256). The timeout is `insight.timeout_seconds` (10, the shortest deadline Google accepts) and the client is created once and reused. With paid credits the gap between trends is `insight.min_interval_seconds` (8). A 429 or 504 still backs off exponentially. One Flash call is in flight at a time, and that loop does not share a lock or an HTTP client with Gemma.
 
-Each insight call sends a compact summary of the last 45 seconds (cue counts, average dB, WPM, gaze-away, posture), not the raw frame history. Output room is `gemma.max_output_tokens` (2048) so the model's thinking tokens do not come back as an empty reply. The client timeout defaults to 45 seconds and cannot be configured below 10, which the API rejects. A 429 or 504 backs off exponentially. Every call logs its latency, and the end summary includes `gemma_avg`.
+Gemma (`gemma.model`, default `gemma-4-26b-a4b-it`, override `GEMMA_MODEL`) is only the slow path: the end-of-session report, and `GemmaClient.generate` for a direct question. It keeps the large output cap (2048) and does not send a thinking config or JSON response mode, because gemma-4 spends hidden thinking tokens and rejects those controls. A Gemma call cannot delay the Flash trend loop. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable either model. With no key, the same slots are filled locally and nothing is sent over the network.
 
-The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `GEMMA` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
+Each insight call sends a compact summary of the last 45 seconds (cue counts, average dB, WPM, gaze-away, posture), not the raw frame history. Every call logs its latency with the model name. The end summary includes `insight_avg` and `gemma_avg` separately.
+
+The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `FLASH` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
 
 When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on either call. The test suite clears the key and model variables and uses fake transports.
 

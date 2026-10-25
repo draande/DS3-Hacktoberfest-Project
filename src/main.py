@@ -25,6 +25,7 @@ from src.intelligence.gemma_client import (
     offline_insights,
     render_report_markdown,
 )
+from src.intelligence.insight_client import InsightClient
 from src.intelligence.session_stats import SessionStats, save_report
 from src.vision.audience_tells import analyze_audience, tells_from_blendshapes
 from src.vision.gaze_tracker import GazeTracker
@@ -57,6 +58,9 @@ class RunSummary:
     demo: bool = True
     theme: str = "ironman"
     fallback: bool = True
+    insight_ok: int = 0
+    insight_failed: int = 0
+    insight_avg: float | None = None
     gemma_ok: int = 0
     gemma_failed: int = 0
     gemma_avg: float | None = None
@@ -155,15 +159,21 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     )
 
 
+def _latency_field(name: str, value: float | None) -> str:
+    if value is None:
+        return ""
+    return f" {name}={value:.1f}s"
+
+
 def format_summary(summary: RunSummary) -> str:
     mode = "demo" if summary.demo else "live"
-    coaching = "offline" if summary.fallback else "gemma"
-    latency = (
-        "" if summary.gemma_avg is None else f" gemma_avg={summary.gemma_avg:.1f}s"
-    )
+    coaching = "offline" if summary.fallback else "flash"
     lines = [
         f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | "
-        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed}{latency} | "
+        f"insight_ok={summary.insight_ok} insight_failed={summary.insight_failed}"
+        f"{_latency_field('insight_avg', summary.insight_avg)} | "
+        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed}"
+        f"{_latency_field('gemma_avg', summary.gemma_avg)} | "
         f"frames={summary.frames}"
     ]
     events = [
@@ -185,7 +195,9 @@ def format_summary(summary: RunSummary) -> str:
 def run_session(
     options: RunOptions,
     config: AppConfig | None = None,
-    client: GemmaClient | None = None,
+    client: InsightClient | None = None,
+    insight_client: InsightClient | None = None,
+    gemma_client: GemmaClient | None = None,
 ) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
@@ -257,8 +269,19 @@ def run_session(
     )
     gestures = GestureDetector()
     stats = SessionStats(window_seconds=45.0)
-    if client is None:
-        client = GemmaClient.from_env(
+    if insight_client is None:
+        insight_client = client
+    if insight_client is None:
+        insight_client = InsightClient.from_env(
+            model=app_config.insight.model,
+            offline=options.offline,
+            min_interval=app_config.insight.min_interval_seconds,
+            timeout=app_config.insight.timeout_seconds,
+            max_output_tokens=app_config.insight.max_output_tokens,
+            thinking_level=app_config.insight.thinking_level,
+        )
+    if gemma_client is None:
+        gemma_client = GemmaClient.from_env(
             model=app_config.gemma.model,
             duration_ms=app_config.cues.duration_ms,
             offline=options.offline,
@@ -268,7 +291,9 @@ def run_session(
             max_output_tokens=app_config.gemma.max_output_tokens,
         )
     summary = RunSummary(
-        demo=options.demo, theme=control.theme_name, fallback=client.used_fallback
+        demo=options.demo,
+        theme=control.theme_name,
+        fallback=insight_client.used_fallback,
     )
     playback = _start_playback(options, app_config.audio.sample_rate, summary)
 
@@ -303,7 +328,8 @@ def run_session(
                 )
         except (CameraUnavailable, FileNotFoundError, RuntimeError) as exc:
             summary.error = str(exc)
-            client.close()
+            insight_client.close()
+            gemma_client.close()
             if playback is not None:
                 playback.close()
             return summary
@@ -442,7 +468,7 @@ def run_session(
                 bool(gaze_state.cue),
                 bool(metrics.posture_alert),
             )
-            client.poll(stats.recent(timestamp), timestamp)
+            insight_client.poll(stats.recent(timestamp), timestamp)
             active = control.filter.consider_many(
                 active_cues(metrics, app_config.cues.duration_ms), timestamp
             )
@@ -459,8 +485,11 @@ def run_session(
                     if playback is not None and playback.active:
                         playback.play(chime_for_cue(active["cue_type"], sample_rate))
 
-            if client.bullets and client.status in {"gemma", "thinking"}:
-                insight_lines = client.bullets
+            if insight_client.bullets and insight_client.status in {
+                "flash",
+                "thinking",
+            }:
+                insight_lines = insight_client.bullets
             else:
                 insight_lines = offline_insights(stats.recent(timestamp))
             renderer.sidebar.push_insights(insight_lines, timestamp)
@@ -476,7 +505,7 @@ def run_session(
                     volume_db=volume_reading.db,
                     wpm=pace_reading.wpm,
                     pulse_t=timestamp,
-                    coaching_status=client.status,
+                    coaching_status=insight_client.status,
                     level_threshold_db=control.effective_speak_up_db(),
                 ),
             )
@@ -485,9 +514,9 @@ def run_session(
             summary.last_frame = rendered
             summary.frames = frame_index + 1
             summary.duration = timestamp
-            summary.fallback = client.used_fallback
-            summary.gemma_ok = client.succeeded
-            summary.gemma_failed = client.failed
+            summary.fallback = insight_client.used_fallback
+            summary.insight_ok = insight_client.succeeded
+            summary.insight_failed = insight_client.failed
             summary.theme = control.theme_name
 
             if preview is not None:
@@ -526,18 +555,22 @@ def run_session(
         if playback is not None:
             playback.close()
         window = stats.overall(summary.duration)
-        source, strengths, improve = client.report(window)
+        source, strengths, improve = gemma_client.report(window)
         summary.report = render_report_markdown(window, strengths, improve, source)
         try:
             path = save_report(summary.report, REPO_ROOT / "reports")
             summary.notes.append(f"report {path}")
         except OSError as exc:
             summary.notes.append(f"report was not saved ({exc})")
-        summary.gemma_ok = client.succeeded
-        summary.gemma_failed = client.failed
-        summary.gemma_avg = client.average_latency
-        summary.fallback = client.succeeded == 0
-        client.close()
+        summary.insight_ok = insight_client.succeeded
+        summary.insight_failed = insight_client.failed
+        summary.insight_avg = insight_client.average_latency
+        summary.gemma_ok = gemma_client.succeeded
+        summary.gemma_failed = gemma_client.failed
+        summary.gemma_avg = gemma_client.average_latency
+        summary.fallback = insight_client.succeeded == 0
+        insight_client.close()
+        gemma_client.close()
     return summary
 
 
