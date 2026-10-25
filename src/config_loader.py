@@ -71,12 +71,29 @@ class CueConfig:
 
 
 @dataclasses.dataclass
+class SidebarConfig:
+    side: str = "right"
+    width_ratio: float = 0.22
+    max_bullets: int = 4
+    ttl_seconds: float = 12.0
+    fade_seconds: float = 3.0
+
+
+@dataclasses.dataclass
+class AvatarConfig:
+    anchor: str = "sidebar_top"
+    height_ratio: float = 0.24
+
+
+@dataclasses.dataclass
 class HudConfig:
     theme: str = "ironman"
     opacity: float = 0.85
     width: int = 1280
     height: int = 720
     fps: int = 30
+    sidebar: SidebarConfig = dataclasses.field(default_factory=SidebarConfig)
+    avatar: AvatarConfig = dataclasses.field(default_factory=AvatarConfig)
 
 
 @dataclasses.dataclass
@@ -183,3 +200,19 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("hud.fps must be positive")
     if not 0 < config.volume.reference_amplitude < 1:
         raise ValueError("volume.reference_amplitude must be between 0 and 1")
+    if config.hud.sidebar.side not in {"left", "right"}:
+        raise ValueError("hud.sidebar.side must be 'left' or 'right'")
+    if not 0 < float(config.hud.sidebar.width_ratio) < 1:
+        raise ValueError("hud.sidebar.width_ratio must be between 0 and 1")
+    if int(config.hud.sidebar.max_bullets) < 1:
+        raise ValueError("hud.sidebar.max_bullets must be at least 1")
+    if float(config.hud.sidebar.ttl_seconds) <= 0:
+        raise ValueError("hud.sidebar.ttl_seconds must be positive")
+    if float(config.hud.sidebar.fade_seconds) < 0:
+        raise ValueError("hud.sidebar.fade_seconds cannot be negative")
+    if float(config.hud.sidebar.fade_seconds) >= float(config.hud.sidebar.ttl_seconds):
+        raise ValueError("hud.sidebar.fade_seconds must be shorter than ttl_seconds")
+    if config.hud.avatar.anchor != "sidebar_top":
+        raise ValueError("hud.avatar.anchor must be 'sidebar_top'")
+    if not 0 < float(config.hud.avatar.height_ratio) <= 1:
+        raise ValueError("hud.avatar.height_ratio must be between 0 and 1")

@@ -43,6 +43,18 @@ class CoachMetrics:
     blendshapes: dict[str, float] = field(default_factory=dict)
 
 
+# Short HUD labels expanded so the sidebar still gets a 3–6 word line.
+_BULLET_EXPANSIONS = {
+    "speak up": "Speak up a bit",
+    "straighten posture": "Straighten your posture",
+    "slow down": "Slow down your pace",
+    "look right": "Look toward the right",
+    "look left": "Look toward the left",
+    "take a breath": "Take a breath now",
+    "make eye contact": "Make eye contact now",
+}
+
+
 def make_cue(
     priority: str,
     cue_type: str,
@@ -50,6 +62,7 @@ def make_cue(
     icon: str,
     duration_ms: int = 3000,
     audio_chime: bool = False,
+    bullets=None,
 ) -> dict:
     return {
         "priority": priority,
@@ -58,7 +71,57 @@ def make_cue(
         "icon": icon,
         "duration_ms": int(duration_ms),
         "audio_chime": bool(audio_chime),
+        "bullets": bullets_for_display(display_text, bullets),
     }
+
+
+def normalize_bullet(text: str | None) -> str | None:
+    """One sidebar line: 3 to 6 words, or None when the text is empty."""
+    cleaned = str(text or "").replace("•", " ").strip()
+    while cleaned[:1] in {"-", "*"}:
+        cleaned = cleaned[1:].strip()
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return None
+    expanded = _BULLET_EXPANSIONS.get(cleaned.lower().rstrip("."))
+    if expanded:
+        cleaned = expanded
+    words = cleaned.split()
+    if len(words) > 6:
+        words = words[:6]
+    if len(words) == 2:
+        words = words + ["now"]
+    elif len(words) == 1:
+        words = ["Focus", "on", words[0].lower()]
+    return " ".join(words)
+
+
+def normalize_bullets(value) -> list[str]:
+    """Accept a list or a newline string. Drop empties and keep at most four."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = [line.strip(" \t") for line in value.splitlines()]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(item) for item in value]
+    else:
+        return []
+    bullets: list[str] = []
+    for part in parts:
+        bullet = normalize_bullet(part)
+        if bullet and bullet not in bullets:
+            bullets.append(bullet)
+        if len(bullets) == 4:
+            break
+    return bullets
+
+
+def bullets_for_display(display_text: str, raw=None) -> list[str]:
+    bullets = normalize_bullets(raw)
+    if bullets:
+        return bullets
+    fallback = normalize_bullet(display_text)
+    return [fallback] if fallback else []
 
 
 def resolve_api_key(explicit: str | None = None) -> str | None:
@@ -77,10 +140,12 @@ def build_prompt(metrics: CoachMetrics) -> str:
         "You are Wingman, a presentation coach inside smart glasses. "
         "Filter transient noise and only flag persistent issues. "
         "Return ONLY a JSON object with keys priority, cue_type, display_text, "
-        "icon, duration_ms, audio_chime. "
+        "icon, duration_ms, audio_chime, bullets. "
         "priority is one of HIGH, MEDIUM, LOW, NONE. "
         "cue_type is one of POSTURE, GAZE, VOLUME, PACE, AUDIENCE, ENCOURAGE, NONE. "
-        "If nothing needs a cue, use priority NONE.\n"
+        "bullets is an array of 1 to 4 strings, most urgent first. "
+        "Each bullet is 3 to 6 words, a terse sidebar line, with no paragraphs. "
+        "If nothing needs a cue, use priority NONE and an empty bullets array.\n"
         "Metrics:\n"
         f"- shoulder_tilt_deg: {metrics.shoulder_tilt_deg:.1f}\n"
         f"- neck_slump_deg: {metrics.neck_slump_deg:.1f}\n"
@@ -118,6 +183,7 @@ def parse_cue_json(text: str | None) -> dict | None:
         icon=str(data["icon"]),
         duration_ms=int(data["duration_ms"]),
         audio_chime=bool(data["audio_chime"]),
+        bullets=data.get("bullets"),
     )
 
 

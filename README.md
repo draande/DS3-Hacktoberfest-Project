@@ -22,6 +22,7 @@ Useful flags:
 
 ```bash
 uv run python main.py --demo --duration 18 --fps 10 --width 640 --height 360
+uv run python main.py --demo --display                 # borderless fullscreen preview
 uv run python main.py --demo --timer 20 --display          # preview the edge vignette
 uv run python main.py --demo --theme minimalist
 uv run python main.py --offline                            # ignore a Gemma API key
@@ -50,11 +51,13 @@ Shown while a preview window is open (`--display`):
 
 | Key | Action |
 | --- | --- |
+| F | Toggle borderless fullscreen |
+| Esc | Leave fullscreen. When the window is already windowed, quit |
+| Q | Quit the preview |
 | Space, Enter, T | Dismiss the active cue (earbud double-tap) |
 | S | Snooze every cue for 30 seconds |
 | M | Switch between Ironman and Minimalist |
 | `[` / `]` | More sensitive / less sensitive coaching thresholds |
-| Q or Esc | Quit the preview |
 
 Gestures, from hand landmarks:
 
@@ -66,9 +69,25 @@ Gestures, from hand landmarks:
 
 Two loud spikes about 50–450 ms apart also dismiss the active cue.
 
+`--display` opens a borderless fullscreen window at the screen resolution and lays the HUD out at that size, so the picture is not a small canvas stretched to fit. On Windows the process is marked DPI-aware before the screen size is read. If the screen size cannot be detected, the window still requests fullscreen at the configured `hud.width` and `hud.height`. Headless mode never opens a window. Esc leaves fullscreen; press Esc again, or Q, to quit.
+
+## Feedback sidebar
+
+Gemma's JSON includes a `bullets` array: 1 to 4 lines, each 3 to 6 words, most urgent first. Those lines appear in a sidebar, on the right by default. Newest lines sit on top. Each line fades out and then expires (`hud.sidebar.ttl_seconds` and `fade_seconds`). Set `hud.sidebar.side` to `left` to flip the column. Offline mode, and any reply that omits `bullets`, fills the sidebar from the cue text so the demo still shows feedback. Ironman draws a dark bracketed panel. Minimalist draws a thin frosted panel without brackets.
+
+## Avatar slot
+
+The avatar itself is not part of this build. The top of the sidebar is reserved for it (`hud.avatar.anchor: sidebar_top`, `hud.avatar.height_ratio`). `src/hud/avatar.py` paints a labeled placeholder and documents the hook:
+
+```python
+draw_avatar(frame, rect, state)  # rect is (x, y, width, height)
+```
+
+`state` is an `AvatarState` with the theme name, the active cue, whether the speaker is talking, volume, pace, and time remaining. Replace `draw_avatar`, or assign your own `AvatarWidget` to `HudRenderer.avatar_widget`. The renderer calls `widget.draw(frame, rect, state)` with the same contract.
+
 ## Configuration
 
-`config/default_config.yaml` holds the plan thresholds (12° slouch, 15% forward head, 4 s gaze, 42 dB speak-up, 180 WPM rush, 5 s cue cooldown, vignette at 25% and 10%). `config/themes.yaml` holds the Ironman and Minimalist palettes.
+`config/default_config.yaml` holds the plan thresholds (12° slouch, 15% forward head, 4 s gaze, 42 dB speak-up, 180 WPM rush, 5 s cue cooldown, vignette at 25% and 10%) plus the sidebar and avatar slot. `config/themes.yaml` holds the Ironman and Minimalist palettes.
 
 Digital audio has no sound-pressure level. Volume uses `dB = 20 log10(RMS / 1e-4)`, so a full-scale tone is about 80 dB and the 42 dB cue lines up with a quiet talker.
 

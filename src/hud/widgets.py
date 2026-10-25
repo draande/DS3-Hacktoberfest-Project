@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from src.config_loader import Theme
+from src.config_loader import AvatarConfig, SidebarConfig, Theme
 
 REFERENCE_WIDTH = 1280
 REFERENCE_HEIGHT = 720
@@ -77,6 +77,51 @@ def widget_names_for_cue(cue: dict | None) -> list[str]:
     elif cue_type == "ENCOURAGE":
         names.append("pace")
     return names
+
+
+def sidebar_bounds(width: int, height: int, sidebar: SidebarConfig) -> WidgetBox:
+    """Pixel box for the feedback column. It always touches the chosen edge."""
+    if width <= 1 or height <= 0:
+        return WidgetBox("sidebar", 0, 0, max(width, 0), max(height, 0))
+    ratio = min(0.9, max(0.05, float(sidebar.width_ratio)))
+    panel_w = max(1, int(round(width * ratio)))
+    panel_w = min(panel_w, width - 1)
+    x = 0 if sidebar.side == "left" else width - panel_w
+    return WidgetBox("sidebar", x, 0, panel_w, height)
+
+
+def avatar_bounds(panel: WidgetBox, avatar: AvatarConfig) -> WidgetBox:
+    """Top of the sidebar. The team draws the avatar inside this rectangle."""
+    ratio = min(1.0, max(0.05, float(avatar.height_ratio)))
+    height = max(1, int(round(panel.h * ratio)))
+    height = min(height, max(1, panel.h))
+    return WidgetBox("avatar", panel.x, panel.y, panel.w, height)
+
+
+def layout_hud(
+    width: int,
+    height: int,
+    names: list[str],
+    sidebar: SidebarConfig,
+    avatar: AvatarConfig,
+) -> tuple[list[WidgetBox], WidgetBox, WidgetBox]:
+    """Place coaching widgets in the area the sidebar does not cover.
+
+    Returns ``(widgets, sidebar_panel, avatar_slot)``. Widget coordinates are
+    already shifted when the sidebar sits on the left.
+    """
+    panel = sidebar_bounds(width, height, sidebar)
+    if sidebar.side == "left":
+        origin_x = panel.w
+        content_w = max(1, width - panel.w)
+    else:
+        origin_x = 0
+        content_w = max(1, width - panel.w)
+    shifted = [
+        WidgetBox(box.name, box.x + origin_x, box.y, box.w, box.h)
+        for box in layout_widgets(content_w, height, names)
+    ]
+    return shifted, panel, avatar_bounds(panel, avatar)
 
 
 def layout_widgets(width: int, height: int, names: list[str]) -> list[WidgetBox]:

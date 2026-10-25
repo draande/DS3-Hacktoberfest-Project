@@ -15,6 +15,7 @@ from src.capture.video_stream import CameraUnavailable, FileVideoSource, WebcamS
 from src.config_loader import AppConfig, load_config
 from src.controls.session_control import SessionControl
 from src.demo_scene import DemoScene
+from src.hud.display import detect_screen_size, prepare_display_frame
 from src.hud.renderer import HudRenderer, HudState, PreviewWindow
 from src.intelligence.gemma_client import CoachMetrics, GemmaClient
 from src.vision.audience_tells import analyze_audience, tells_from_blendshapes
@@ -204,6 +205,8 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
         app_config.theme(control.theme_name),
         warning_ratio=app_config.timer.warning_ratio,
         critical_ratio=app_config.timer.critical_ratio,
+        sidebar_config=app_config.hud.sidebar,
+        avatar_config=app_config.hud.avatar,
     )
     volume = VolumeAnalyzer(
         threshold_db=app_config.volume.speak_up_db,
@@ -247,7 +250,14 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
     video = None
     microphone = None
     backend = None
-    preview = PreviewWindow(options.display_backend) if options.display else None
+    preview = None
+    if options.display:
+        preview = PreviewWindow(
+            options.display_backend,
+            screen_size=detect_screen_size(),
+            windowed_size=(width, height),
+            fullscreen=True,
+        )
     if scene is None:
         try:
             if options.video:
@@ -279,9 +289,15 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
     try:
         while frame_limit is None or frame_index < frame_limit:
             timestamp = frame_index / fps
+            if preview is not None:
+                target_w, target_h = preview.target_size()
+            else:
+                target_w, target_h = width, height
             hand = None
             blendshapes = None
             if scene is not None:
+                scene.width = target_w
+                scene.height = target_h
                 chunk_count = max(1, int(round(sample_rate / fps)))
                 sample = scene.sample(timestamp, audio_cursor, chunk_count)
                 audio_cursor += chunk_count
@@ -309,6 +325,11 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                     audio = microphone.pop_ready().samples
                 else:
                     audio = np.zeros(max(1, int(sample_rate / fps)), dtype=np.float32)
+                if preview is not None and (frame.shape[1], frame.shape[0]) != (
+                    target_w,
+                    target_h,
+                ):
+                    frame = prepare_display_frame(frame, target_w, target_h)
 
             posture = (
                 analyze_posture(
@@ -372,6 +393,9 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 summary.cues.append(
                     (timestamp, active["cue_type"], active["display_text"])
                 )
+                renderer.sidebar.push(
+                    active.get("bullets") or [active["display_text"]], timestamp
+                )
                 if active.get("audio_chime"):
                     chime = chime_for_cue(active["cue_type"], sample_rate)
                     summary.chimes += 1
@@ -403,6 +427,8 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 key = preview.show(rendered)
                 if key == "quit":
                     break
+                if key in {"fullscreen", "exit_fullscreen"}:
+                    key = None
                 if key:
                     action = control.handle_key(key, timestamp)
                     if action == "quit":

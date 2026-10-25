@@ -1,8 +1,10 @@
 import numpy as np
 import pytest
 
-from src.config_loader import load_config
+from src.config_loader import SidebarConfig, load_config
+from src.hud.avatar import AvatarState, draw_avatar
 from src.hud.renderer import HudRenderer, HudState
+from src.hud.sidebar import FeedbackSidebar
 from src.hud.vignette import (
     apply_vignette,
     edge_mask,
@@ -12,6 +14,7 @@ from src.hud.vignette import (
 from src.hud.widgets import (
     format_timer,
     hex_to_bgr,
+    layout_hud,
     layout_widgets,
     pygame_surface_size,
     widget_names_for_cue,
@@ -103,7 +106,14 @@ def test_renderer_draws_a_posture_cue_inside_the_frame():
     )
     assert rendered.shape == frame.shape
     assert int(rendered.sum()) > 0
-    posture = next(box for box in layout_widgets(640, 360, ["posture"]))
+    boxes, _panel, _avatar = layout_hud(
+        640,
+        360,
+        ["posture"],
+        renderer.sidebar_config,
+        renderer.avatar_config,
+    )
+    posture = next(box for box in boxes)
     region = rendered[
         posture.y : posture.y + posture.h, posture.x : posture.x + posture.w
     ]
@@ -127,6 +137,99 @@ def test_minimalist_theme_switches_the_palette():
     )
     assert rendered.shape == frame.shape
     assert int(rendered.max()) > 200
+
+
+def test_sidebar_keeps_newest_on_top_and_fades_them_out():
+    bar = FeedbackSidebar(max_bullets=4, ttl_seconds=10, fade_seconds=4)
+    bar.push(["First note here", "Second note here"], 0.0)
+    assert [text for text, _alpha in bar.visible(0.0)] == [
+        "First note here",
+        "Second note here",
+    ]
+    bar.push(["Third note here"], 1.0)
+    assert bar.visible(1.0)[0][0] == "Third note here"
+    bar.push(["Second note here"], 2.0)
+    visible = bar.visible(2.0)
+    assert visible[0] == ("Second note here", 1.0)
+    assert bar.visible(9.0)[0][1] == pytest.approx(0.75)
+    assert bar.visible(12.0) == []
+
+
+def test_sidebar_caps_visible_bullets_at_four_even_if_config_is_larger():
+    bar = FeedbackSidebar(max_bullets=8, ttl_seconds=30, fade_seconds=1)
+    assert bar.max_bullets == 4
+    bar.push(
+        ["one two three", "four five six", "seven eight nine", "ten eleven twelve"],
+        0.0,
+    )
+    bar.push(["thirteen fourteen fifteen"], 1.0)
+    visible = [text for text, _alpha in bar.visible(1.0)]
+    assert visible[0] == "thirteen fourteen fifteen"
+    assert len(visible) == 4
+    assert "ten eleven twelve" not in visible
+
+
+def test_avatar_slot_is_the_top_of_the_sidebar_and_widgets_stay_clear():
+    config = load_config()
+    names = ["timer", "posture", "volume", "scan"]
+    boxes, panel, avatar = layout_hud(
+        640, 360, names, config.hud.sidebar, config.hud.avatar
+    )
+    assert panel.x + panel.w == 640
+    assert avatar.x == panel.x and avatar.y == 0
+    assert avatar.w == panel.w
+    assert 0 < avatar.h < panel.h
+    assert avatar.inside(640, 360)
+    for box in boxes:
+        assert box.inside(640, 360)
+        assert box.x + box.w <= panel.x
+
+    left = SidebarConfig(side="left", width_ratio=0.22)
+    left_boxes, left_panel, _left_avatar = layout_hud(
+        640, 360, names, left, config.hud.avatar
+    )
+    assert left_panel.x == 0
+    for box in left_boxes:
+        assert box.x >= left_panel.w
+
+    frame = np.zeros((360, 640, 3), np.uint8)
+    draw_avatar(
+        frame,
+        (avatar.x, avatar.y, avatar.w, avatar.h),
+        AvatarState("ironman", "POSTURE", "Straighten Posture", False, 20, 140, 100),
+    )
+    region = frame[avatar.y : avatar.y + avatar.h, avatar.x : avatar.x + avatar.w]
+    assert int(region.sum()) > 0
+    assert int(frame[:, : panel.x].sum()) == 0
+
+
+def test_renderer_paints_the_sidebar_for_both_themes():
+    config = load_config()
+    cue = make_cue("HIGH", "POSTURE", "Straighten Posture", "arrow_up")
+    for theme_name in ("ironman", "minimalist"):
+        renderer = HudRenderer(
+            config.theme(theme_name),
+            opacity=1.0,
+            sidebar_config=config.hud.sidebar,
+            avatar_config=config.hud.avatar,
+        )
+        renderer.sidebar.push(cue["bullets"], 0.0)
+        rendered = renderer.render(
+            np.zeros((180, 320, 3), np.uint8),
+            HudState(
+                remaining_seconds=10,
+                remaining_ratio=0.5,
+                cue=cue,
+                volume_db=30,
+                wpm=140,
+                pulse_t=0.0,
+            ),
+        )
+        _boxes, panel, _avatar = layout_hud(
+            320, 180, ["posture"], renderer.sidebar_config, renderer.avatar_config
+        )
+        strip = rendered[:, panel.x : panel.x + panel.w]
+        assert int(strip.max()) > 0
 
 
 def test_pygame_surface_matches_the_frame_size():

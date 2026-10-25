@@ -25,6 +25,11 @@ def test_default_config_loads_plan_thresholds():
     assert config.audio.sample_rate == 16000
     assert config.hud.fps == 30
     assert config.hud.theme == "ironman"
+    assert config.hud.sidebar.side == "right"
+    assert config.hud.sidebar.max_bullets == 4
+    assert config.hud.sidebar.ttl_seconds == 12
+    assert config.hud.avatar.anchor == "sidebar_top"
+    assert config.hud.avatar.height_ratio == 0.24
 
 
 def test_themes_match_the_spec_palettes():
@@ -57,6 +62,21 @@ def test_unknown_theme_is_rejected(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="missing"):
+        load_config(config_path, themes)
+
+
+def test_sidebar_side_must_be_left_or_right(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "hud:\n  theme: ironman\n  sidebar:\n    side: middle\n",
+        encoding="utf-8",
+    )
+    themes = tmp_path / "themes.yaml"
+    themes.write_text(
+        "ironman:\n  name: Ironman\n  colors:\n    primary: '#00F0FF'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="sidebar"):
         load_config(config_path, themes)
 
 

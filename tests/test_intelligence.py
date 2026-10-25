@@ -4,6 +4,8 @@ from src.intelligence.gemma_client import (
     GemmaClient,
     build_prompt,
     make_cue,
+    normalize_bullet,
+    normalize_bullets,
     offline_cue,
     parse_cue_json,
 )
@@ -23,7 +25,9 @@ def test_offline_fallback_ranks_posture_then_volume_then_pace():
         "icon",
         "duration_ms",
         "audio_chime",
+        "bullets",
     }
+    assert posture["bullets"] == ["Straighten your posture"]
 
     volume = offline_cue(CoachMetrics(speak_up=True, wpm=140))
     assert volume["cue_type"] == "VOLUME"
@@ -47,6 +51,8 @@ def test_prompt_includes_the_live_metrics_and_json_parser_rejects_junk():
     assert "37.5" in prompt
     assert "190" in prompt
     assert "posture_alert: True" in prompt
+    assert "bullets" in prompt
+    assert "3 to 6 words" in prompt
     parsed = parse_cue_json(
         'sure {"priority":"LOW","cue_type":"PACE","display_text":"Slow down",'
         '"icon":"slow_down","duration_ms":3000,"audio_chime":false} thanks'
@@ -54,6 +60,56 @@ def test_prompt_includes_the_live_metrics_and_json_parser_rejects_junk():
     assert parsed["cue_type"] == "PACE"
     assert parse_cue_json("no json here") is None
     assert parse_cue_json('{"priority": "HIGH"}') is None
+
+
+def test_sidebar_bullets_are_trimmed_capped_and_expanded():
+    assert normalize_bullet("Speak up") == "Speak up a bit"
+    assert normalize_bullet("Straighten Posture") == "Straighten your posture"
+    assert normalize_bullet("Slow down") == "Slow down your pace"
+    assert normalize_bullet("Look right") == "Look toward the right"
+    assert normalize_bullet("Take a breath") == "Take a breath now"
+    assert normalize_bullet("   ") is None
+    assert normalize_bullet("one two three four five six seven") == (
+        "one two three four five six"
+    )
+    assert normalize_bullets(
+        ["", "  ", "Look right", "one two three four five six seven eight"]
+    ) == ["Look toward the right", "one two three four five six"]
+    capped = normalize_bullets(["a b c", "d e f", "g h i", "j k l", "m n o"])
+    assert capped == ["a b c", "d e f", "g h i", "j k l"]
+    assert normalize_bullets("Speak up a bit\n\nSlow down your pace") == [
+        "Speak up a bit",
+        "Slow down your pace",
+    ]
+
+
+def test_parse_keeps_sidebar_bullets_and_derives_them_when_missing():
+    parsed = parse_cue_json(
+        '{"priority":"HIGH","cue_type":"VOLUME","display_text":"Speak up",'
+        '"icon":"volume_up","duration_ms":3000,"audio_chime":true,'
+        '"bullets":["Project your voice now", "", "Pause between your points"]}'
+    )
+    assert parsed["bullets"] == ["Project your voice now", "Pause between your points"]
+    derived = parse_cue_json(
+        '{"priority":"MEDIUM","cue_type":"PACE","display_text":"Slow down",'
+        '"icon":"slow_down","duration_ms":3000,"audio_chime":false}'
+    )
+    assert derived["cue_type"] == "PACE"
+    assert derived["bullets"] == ["Slow down your pace"]
+    for cue in (
+        offline_cue(CoachMetrics(posture_alert=True)),
+        offline_cue(CoachMetrics(speak_up=True)),
+        offline_cue(CoachMetrics(rushing=True)),
+        offline_cue(CoachMetrics(run_on=True)),
+        offline_cue(
+            CoachMetrics(
+                gaze_cue="look_right", gaze_text="Look right", gaze_icon="arrow_right"
+            )
+        ),
+    ):
+        assert cue["bullets"]
+        for bullet in cue["bullets"]:
+            assert 3 <= len(bullet.split()) <= 6
 
 
 def test_client_uses_transport_json_and_falls_back_when_it_is_garbage():

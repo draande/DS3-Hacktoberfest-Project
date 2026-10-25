@@ -67,6 +67,17 @@ hud:
   width: 1280
   height: 720
   fps: 30
+  # Gemma's short bullets. Newest line is on top and fades out over fade_seconds.
+  sidebar:
+    side: right
+    width_ratio: 0.22
+    max_bullets: 4
+    ttl_seconds: 12
+    fade_seconds: 3
+  # Reserved for the avatar. See draw_avatar in src/hud/avatar.py.
+  avatar:
+    anchor: sidebar_top
+    height_ratio: 0.24
 
 audio:
   sample_rate: 16000
