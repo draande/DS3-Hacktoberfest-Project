@@ -6,9 +6,19 @@ import pytest
 from src.demo_scene import face_landmarks, hand_landmarks, neutral_pose, slouch_pose
 from src.vision.audience_tells import analyze_audience, tells_from_blendshapes
 from src.vision.gaze_tracker import GazeTracker, measure_gaze
-from src.vision.gesture_detector import GestureDetector, is_open_palm, is_pinch
+from src.vision.gesture_detector import (
+    GestureDetector,
+    is_open_palm,
+    is_pinch,
+    pinch_ratio,
+)
 from src.vision.mediapipe_backend import MediaPipeBackend
-from src.vision.pose_tracker import analyze_posture, shoulder_tilt_degrees
+from src.vision.pose_tracker import (
+    PostureCalibrator,
+    PostureMetrics,
+    analyze_posture,
+    shoulder_tilt_degrees,
+)
 
 
 def _pose_with_shoulder_drop(degrees: float) -> np.ndarray:
@@ -143,6 +153,44 @@ def test_open_palm_pinch_and_swipe():
     assert any(
         event.swipe == "right" and event.name == "swipe_right" for event in events
     )
+
+
+def test_pinch_uses_hysteresis_and_a_borderline_gap_does_not_engage():
+    def with_gap(gap: float) -> np.ndarray:
+        points = hand_landmarks("pinch").copy()
+        points[8] = points[4].copy()
+        points[8, 0] = points[4, 0] + gap
+        return points
+
+    palm = pinch_ratio(hand_landmarks("pinch"))
+    assert palm > 0
+    mid = with_gap(0.045)
+    tight = with_gap(0.01)
+    wide = with_gap(0.09)
+    assert 0.35 < pinch_ratio(mid) < 0.55
+    assert pinch_ratio(tight) < 0.35
+    assert pinch_ratio(wide) > 0.55
+    detector = GestureDetector()
+    assert detector.update(mid, 0.0).pinch is False
+    assert detector.update(tight, 0.1).pinch is True
+    assert detector.update(mid, 0.2).pinch is True
+    assert detector.update(wide, 0.3).pinch is False
+
+
+def test_live_posture_baseline_ignores_the_laptop_angle_until_it_changes():
+    calibrator = PostureCalibrator(
+        warmup_seconds=3.0, slouch_margin=8.0, forward_margin=0.08
+    )
+    seated = PostureMetrics(20.0, 0.0, 0.0, 0.02, True)
+    assert calibrator.observe(seated, 0.0).straighten is False
+    assert calibrator.observe(seated, 2.5).straighten is False
+    assert calibrator.ready is False
+    settled = calibrator.observe(seated, 3.0)
+    assert calibrator.ready is True
+    assert settled.straighten is False
+    assert calibrator.baseline_slouch == pytest.approx(20.0)
+    extra = PostureMetrics(29.0, 0.0, 0.0, 0.02, True)
+    assert calibrator.observe(extra, 4.0).straighten is True
 
 
 def test_missing_mediapipe_models_do_not_raise(tmp_path):

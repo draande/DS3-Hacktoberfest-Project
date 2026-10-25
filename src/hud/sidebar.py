@@ -32,6 +32,7 @@ class FeedbackSidebar:
         self.ttl_seconds = float(ttl_seconds)
         self.fade_seconds = max(0.0, float(fade_seconds))
         self._items: list[_Bullet] = []
+        self._insights: list[_Bullet] = []
 
     def push(self, texts, now: float) -> None:
         incoming = normalize_bullets(texts)
@@ -39,6 +40,17 @@ class FeedbackSidebar:
             self._items = [item for item in self._items if item.text != text]
             self._items.insert(0, _Bullet(text, float(now)))
         self._items = self._items[: self.max_bullets]
+
+    def push_insights(self, texts, now: float) -> None:
+        """Replace the Gemma trend lines. Same text does not reset the clock."""
+        incoming = normalize_bullets(texts)[:3]
+        if incoming == [item.text for item in self._insights]:
+            return
+        self._insights = [_Bullet(text, float(now)) for text in incoming]
+
+    def visible_insights(self, now: float) -> list[tuple[str, float]]:
+        del now
+        return [(item.text, 1.0) for item in self._insights]
 
     def visible(self, now: float) -> list[tuple[str, float]]:
         shown: list[tuple[str, float]] = []
@@ -57,8 +69,11 @@ class FeedbackSidebar:
         return shown
 
 
+BADGE_LABELS = {"gemma": "GEMMA", "thinking": "THINKING", "offline": "OFFLINE"}
+
+
 def coaching_badge_rect(panel: WidgetBox) -> tuple[int, int, int, int]:
-    """Small strip at the bottom of the sidebar: GEMMA when live, OFFLINE otherwise."""
+    """Small strip at the bottom of the sidebar for the Gemma status."""
     height = 16 if panel.h >= 40 else max(4, panel.h // 5)
     height = min(height, max(1, panel.h))
     inset = 2 if panel.w > 8 else 0
@@ -76,9 +91,10 @@ def draw_sidebar(
     theme: Theme,
     avatar_state: AvatarState,
     avatar_widget: AvatarWidget,
-    coaching_live: bool = False,
+    coaching_status: str = "offline",
+    insights: list[tuple[str, float]] | None = None,
 ) -> None:
-    """Fill the side panel, paint the avatar slot, then the bullet lines."""
+    """Fill the side panel, paint the avatar slot, then cue and insight lines."""
     if panel.w <= 1 or panel.h <= 1:
         return
     _fill_panel(image, panel, theme)
@@ -88,8 +104,8 @@ def draw_sidebar(
         (avatar_box.x, avatar_box.y, avatar_box.w, avatar_box.h),
         avatar_state,
     )
-    _draw_bullets(image, panel, avatar_box, bullets, theme)
-    _draw_coaching_badge(image, panel, theme, coaching_live)
+    _draw_bullets(image, panel, avatar_box, bullets, theme, insights or [])
+    _draw_coaching_badge(image, panel, theme, coaching_status)
 
 
 def _fill_panel(image: np.ndarray, panel: WidgetBox, theme: Theme) -> None:
@@ -135,6 +151,7 @@ def _draw_bullets(
     avatar_box: WidgetBox,
     bullets: list[tuple[str, float]],
     theme: Theme,
+    insights: list[tuple[str, float]],
 ) -> None:
     text_color = hex_to_bgr(theme.colors.get("text", "#FFFFFF"))
     font = (
@@ -165,10 +182,40 @@ def _draw_bullets(
             cv2.LINE_AA,
         )
         y += line_h
+    if insights and y + line_h <= bottom:
+        label = hex_to_bgr(theme.colors.get("primary", "#FFFFFF"))
+        cv2.putText(
+            image,
+            "INSIGHT",
+            (x, y),
+            font,
+            scale,
+            label,
+            1,
+            cv2.LINE_AA,
+        )
+        y += line_h
+        for text, alpha in insights:
+            if y > bottom:
+                break
+            color = tuple(
+                max(0, min(255, int(round(channel * alpha)))) for channel in text_color
+            )
+            cv2.putText(
+                image,
+                f"- {text}",
+                (x, y),
+                font,
+                scale,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            y += line_h
 
 
 def _draw_coaching_badge(
-    image: np.ndarray, panel: WidgetBox, theme: Theme, live: bool
+    image: np.ndarray, panel: WidgetBox, theme: Theme, status: str
 ) -> None:
     x, y, width, height = coaching_badge_rect(panel)
     frame_h, frame_w = image.shape[:2]
@@ -178,12 +225,13 @@ def _draw_coaching_badge(
     y0 = max(0, min(y, frame_h))
     if x1 <= x0 or y1 <= y0:
         return
-    role = "primary" if live else "neutral"
-    color = hex_to_bgr(theme.colors.get(role, "#FFFFFF" if live else "#7A8B99"))
+    kind = status if status in BADGE_LABELS else "offline"
+    role = {"gemma": "primary", "thinking": "warning", "offline": "neutral"}[kind]
+    color = hex_to_bgr(theme.colors.get(role, "#7A8B99"))
     cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), color, -1)
     if height < 12 or width < 36:
         return
-    label = "GEMMA" if live else "OFFLINE"
+    label = BADGE_LABELS[kind]
     text = hex_to_bgr(theme.colors.get("background", "#000000"))
     cv2.putText(
         image,

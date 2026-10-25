@@ -16,6 +16,7 @@ from src.hud.widgets import (
     hex_to_bgr,
     layout_hud,
     layout_widgets,
+    mic_meter_box,
     pygame_surface_size,
     widget_names_for_cue,
 )
@@ -232,7 +233,7 @@ def test_renderer_paints_the_sidebar_for_both_themes():
         assert int(strip.max()) > 0
 
 
-def test_coaching_badge_switches_between_gemma_and_offline():
+def test_coaching_badge_switches_between_gemma_thinking_and_offline():
     config = load_config()
     theme = config.theme("ironman")
     renderer = HudRenderer(
@@ -245,8 +246,13 @@ def test_coaching_badge_switches_between_gemma_and_offline():
     kwargs = dict(
         remaining_seconds=10, remaining_ratio=0.8, cue=None, volume_db=50, wpm=140
     )
-    live = renderer.render(frame.copy(), HudState(**kwargs, coaching_live=True))
-    offline = renderer.render(frame.copy(), HudState(**kwargs, coaching_live=False))
+    live = renderer.render(frame.copy(), HudState(**kwargs, coaching_status="gemma"))
+    thinking = renderer.render(
+        frame.copy(), HudState(**kwargs, coaching_status="thinking")
+    )
+    offline = renderer.render(
+        frame.copy(), HudState(**kwargs, coaching_status="offline")
+    )
     _boxes, panel, _avatar = layout_hud(
         320, 180, ["timer"], renderer.sidebar_config, renderer.avatar_config
     )
@@ -254,8 +260,40 @@ def test_coaching_badge_switches_between_gemma_and_offline():
     assert tuple(int(channel) for channel in live[y, x + 2]) == hex_to_bgr(
         theme.colors["primary"]
     )
+    assert tuple(int(channel) for channel in thinking[y, x + 2]) == hex_to_bgr(
+        theme.colors["warning"]
+    )
     assert tuple(int(channel) for channel in offline[y, x + 2]) == hex_to_bgr(
         theme.colors["neutral"]
+    )
+
+
+def test_mic_meter_shows_level_and_the_speak_up_line():
+    config = load_config()
+    theme = config.theme("ironman")
+    renderer = HudRenderer(
+        theme,
+        opacity=1.0,
+        sidebar_config=config.hud.sidebar,
+        avatar_config=config.hud.avatar,
+    )
+    kwargs = dict(
+        remaining_seconds=10, remaining_ratio=0.8, cue=None, wpm=140, pulse_t=0.0
+    )
+    quiet = renderer.render(
+        np.zeros((180, 320, 3), np.uint8), HudState(**kwargs, volume_db=30)
+    )
+    loud = renderer.render(
+        np.zeros((180, 320, 3), np.uint8), HudState(**kwargs, volume_db=70)
+    )
+    box = mic_meter_box(320, 180, config.hud.sidebar)
+    mid = box.x + box.w // 2
+    assert int(quiet[box.y + 2, mid].sum()) == 0
+    assert int(loud[box.y + 2, mid].sum()) > 0
+    span = 60.0
+    mark = box.x + 1 + int(round((box.w - 2) * (42.0 - 20.0) / span))
+    assert tuple(int(channel) for channel in quiet[box.y + 1, mark]) == hex_to_bgr(
+        theme.colors["alert"]
     )
 
 

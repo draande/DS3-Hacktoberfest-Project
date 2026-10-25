@@ -6,14 +6,21 @@ from src.intelligence.cue_filter import CueFilter
 from src.intelligence.gemma_client import (
     DEFAULT_MODEL,
     CoachMetrics,
+    CoachWindow,
     GemmaClient,
+    active_cues,
     build_prompt,
+    deterministic_report,
+    http_timeout_ms,
     make_cue,
     normalize_bullet,
     normalize_bullets,
     offline_cue,
     parse_cue_json,
+    parse_insight_json,
+    render_report_markdown,
 )
+from src.intelligence.session_stats import save_report
 
 _ENCOURAGE = (
     '{"priority":"LOW","cue_type":"ENCOURAGE","display_text":"Great pace",'
@@ -65,13 +72,21 @@ def test_offline_fallback_ranks_posture_then_volume_then_pace():
     assert offline_cue(CoachMetrics()) is None
 
 
-def test_prompt_includes_the_live_metrics_and_json_parser_rejects_junk():
-    prompt = build_prompt(CoachMetrics(volume_db=37.5, wpm=190, posture_alert=True))
-    assert "37.5" in prompt
-    assert "190" in prompt
-    assert "posture_alert: True" in prompt
+def test_prompt_is_compact_and_json_fences_still_parse():
+    prompt = build_prompt(
+        CoachWindow(
+            avg_db=37, avg_wpm=190, posture_ratio=0.4, gaze_away_ratio=0.2, seconds=45
+        )
+    )
+    assert "db=37" in prompt
+    assert "wpm=190" in prompt
+    assert "posture=0.40" in prompt
+    assert "gaze=0.20" in prompt
     assert "bullets" in prompt
-    assert "3 to 6 words" in prompt
+    assert "You are Wingman" not in prompt
+    assert len(prompt) < 240
+    fenced = parse_insight_json('```json\n{"bullets":["Posture slipping often"]}\n```')
+    assert fenced == ["Posture slipping often"]
     parsed = parse_cue_json(
         'sure {"priority":"LOW","cue_type":"PACE","display_text":"Slow down",'
         '"icon":"slow_down","duration_ms":3000,"audio_chime":false} thanks'
@@ -132,26 +147,23 @@ def test_parse_keeps_sidebar_bullets_and_derives_them_when_missing():
 
 
 def test_client_uses_transport_json_and_falls_back_when_it_is_garbage():
-    metrics = CoachMetrics(posture_alert=True)
+    window = CoachWindow(posture_ratio=0.8, avg_db=35, seconds=40)
 
     def good_transport(_prompt: str) -> str:
-        return (
-            '{"priority":"LOW","cue_type":"ENCOURAGE","display_text":"Great pace",'
-            '"icon":"ok","duration_ms":2000,"audio_chime":false}'
-        )
+        return '{"bullets":["Posture slipping often"]}'
 
     client = GemmaClient(api_key="test-key", transport=good_transport)
-    cue = client.arbitrate(metrics)
-    assert cue["cue_type"] == "ENCOURAGE"
+    bullets = client.insights(window)
+    assert bullets == ["Posture slipping often"]
     assert client.used_fallback is False
+    assert "db=" in build_prompt(window)
 
     broken = GemmaClient(api_key="test-key", transport=lambda _prompt: "not json")
-    fallback = broken.arbitrate(metrics)
-    assert fallback["cue_type"] == "POSTURE"
+    assert broken.insights(window) is None
     assert broken.used_fallback is True
 
     quiet = GemmaClient(api_key=None)
-    assert quiet.arbitrate(CoachMetrics()) is None
+    assert quiet.insights(CoachWindow()) is None
     assert quiet.used_fallback is True
 
 
@@ -169,36 +181,40 @@ def test_gemma_model_env_overrides_the_config(monkeypatch):
 def test_poll_does_not_block_on_a_slow_transport():
     def slow(_prompt: str) -> str:
         time.sleep(1.5)
-        return _ENCOURAGE
+        return '{"bullets":["Pace steadier now"]}'
 
     client = GemmaClient(api_key="test-key", transport=slow, min_interval=0, timeout=5)
-    metrics = CoachMetrics(posture_alert=True)
+    window = CoachWindow(avg_wpm=150, seconds=30)
     started = time.perf_counter()
-    cues = [client.poll(metrics, now=float(i)) for i in range(12)]
+    results = [client.poll(window, now=float(i)) for i in range(12)]
     elapsed = time.perf_counter() - started
     assert elapsed < 0.5
     assert client.pending is True
-    assert all(cue["cue_type"] == "POSTURE" for cue in cues)
+    assert client.status == "thinking"
+    assert all(item is None for item in results)
     client.close()
 
 
 def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
     caplog.set_level(logging.WARNING, logger="wingman.gemma")
-    metrics = CoachMetrics(posture_alert=True)
+    window = CoachWindow(posture_ratio=0.6, avg_db=36, seconds=40)
     good = GemmaClient(
         api_key="test-key",
-        transport=lambda _prompt: _ENCOURAGE,
+        transport=lambda _prompt: '{"bullets":["Posture slipping often"]}',
         min_interval=2,
         timeout=2,
     )
-    assert good.poll(metrics, now=0)["cue_type"] == "POSTURE"
+    assert good.poll(window, now=0) is None
+    assert good.status == "thinking"
     _wait_until(lambda: not good.pending)
-    shown = good.poll(metrics, now=0.2)
-    assert shown["cue_type"] == "ENCOURAGE"
+    shown = good.poll(window, now=0.2)
+    assert shown == ["Posture slipping often"]
+    assert good.status == "gemma"
     assert good.succeeded == 1
     assert good.failed == 0
     assert good.used_fallback is False
     assert good.pending is False
+    assert good.average_latency is not None and good.average_latency >= 0
 
     def raise_404(_prompt: str) -> str:
         error = RuntimeError("NOT_FOUND")
@@ -208,11 +224,12 @@ def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
     bad = GemmaClient(
         api_key="test-key", transport=raise_404, min_interval=1, timeout=2
     )
-    bad.poll(metrics, now=0)
+    bad.poll(window, now=0)
     _wait_until(lambda: bad.failed >= 1 and not bad.pending)
-    assert bad.poll(metrics, now=0.1)["cue_type"] == "POSTURE"
+    assert bad.poll(window, now=0.1) is None
+    assert bad.status == "offline"
     assert bad.used_fallback is True
-    bad.poll(metrics, now=5)
+    bad.poll(window, now=5)
     _wait_until(lambda: bad.failed >= 2 and not bad.pending)
     warnings = [
         record.getMessage()
@@ -228,7 +245,7 @@ def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
         min_interval=0,
         timeout=2,
     )
-    messy.poll(CoachMetrics(), now=0)
+    messy.poll(window, now=0)
     _wait_until(lambda: messy.failed >= 1 and not messy.pending)
     assert messy.failed == 1
     assert any("unparseable" in record.getMessage() for record in caplog.records)
@@ -243,8 +260,9 @@ def test_a_timed_out_call_is_a_failure_and_poll_does_not_wait_for_it():
         api_key="test-key", transport=slow, min_interval=5, timeout=0.15
     )
     started = time.perf_counter()
-    cue = client.poll(CoachMetrics(posture_alert=True), now=0)
-    assert cue["cue_type"] == "POSTURE"
+    cue = client.poll(CoachWindow(posture_ratio=1, seconds=20), now=0)
+    assert cue is None
+    assert client.status == "thinking"
     assert time.perf_counter() - started < 0.15
     _wait_until(lambda: client.failed >= 1, timeout=1)
     assert time.perf_counter() - started < 0.45
@@ -254,15 +272,90 @@ def test_a_timed_out_call_is_a_failure_and_poll_does_not_wait_for_it():
     client.close()
 
 
-def test_none_priority_from_the_model_suppresses_the_cue():
+def test_empty_insight_json_does_not_invent_a_trend():
     client = GemmaClient(
         api_key="test-key",
-        transport=lambda _prompt: (
-            '{"priority":"NONE","cue_type":"NONE","display_text":"",'
-            '"icon":"none","duration_ms":0,"audio_chime":false}'
-        ),
+        transport=lambda _prompt: '{"bullets":[]}',
     )
-    assert client.arbitrate(CoachMetrics(posture_alert=True)) is None
+    assert client.insights(CoachWindow(seconds=20)) is None
+
+
+def test_posture_yields_so_volume_is_also_shown():
+    cue_filter = CueFilter(cooldown_seconds=5.0, global_gap_seconds=1.0)
+    metrics = CoachMetrics(posture_alert=True, speak_up=True)
+    pending = active_cues(metrics)
+    assert [cue["cue_type"] for cue in pending] == ["POSTURE", "VOLUME"]
+    shown = []
+    now = 0.0
+    for _ in range(6):
+        cue = cue_filter.consider_many(pending, now)
+        if cue_filter.fired_at == now:
+            shown.append(cue["cue_type"])
+        now += 3.1
+    assert "POSTURE" in shown
+    assert "VOLUME" in shown
+    assert shown[0] == "POSTURE"
+
+
+def test_retryable_gemma_errors_back_off(caplog):
+    caplog.set_level(logging.INFO, logger="wingman.gemma")
+
+    def raise_504(_prompt: str) -> str:
+        error = RuntimeError("DEADLINE_EXCEEDED")
+        error.code = 504
+        raise error
+
+    client = GemmaClient(
+        api_key="test-key", transport=raise_504, min_interval=10, timeout=2
+    )
+    window = CoachWindow(avg_db=33, seconds=30)
+    client.poll(window, now=0)
+    _wait_until(lambda: client.failed >= 1 and not client.pending)
+    client.poll(window, now=10)
+    time.sleep(0.05)
+    assert client.failed == 1
+    assert client.pending is False
+    client.poll(window, now=30)
+    _wait_until(lambda: client.failed >= 2 and not client.pending)
+    assert client.average_latency is not None
+    assert http_timeout_ms(8) == 10_000
+    assert http_timeout_ms(45) == 45_000
+
+
+def test_session_report_uses_gemma_or_the_local_summary(tmp_path):
+    window = CoachWindow(
+        cue_counts={"POSTURE": 4, "VOLUME": 2},
+        avg_db=36,
+        avg_wpm=150,
+        gaze_away_ratio=0.1,
+        posture_ratio=0.5,
+        seconds=60,
+    )
+    offline = GemmaClient(api_key=None)
+    source, strengths, improve = offline.report(window)
+    assert source == "offline"
+    assert len(strengths) == 3 and len(improve) == 3
+    text = render_report_markdown(window, strengths, improve, source)
+    path = save_report(text, tmp_path)
+    saved = path.read_text(encoding="utf-8")
+    assert saved.startswith("# Wingman session")
+    assert "Strengths" in saved and "Work on" in saved
+    assert "36 dB" in saved
+
+    payload = (
+        '{"strengths":["Clear voice throughout.","Steady eye contact today.",'
+        '"Calm opening pace."],"improve":["Sit taller after the start.",'
+        '"Pause between the sections.","Lift the quiet middle third."]}'
+    )
+    live = GemmaClient(
+        api_key="test-key", transport=lambda _prompt: payload, report_timeout=2
+    )
+    source, strengths, improve = live.report(window)
+    assert source == "gemma"
+    assert strengths[0].startswith("Clear voice")
+    assert len(improve) == 3
+    local_strengths, _local_improve = deterministic_report(window)
+    assert local_strengths
 
 
 def test_cooldown_blocks_repeated_alerts_and_snooze_blocks_everything():

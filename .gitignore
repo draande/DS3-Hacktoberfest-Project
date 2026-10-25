@@ -16,3 +16,6 @@ htmlcov/
 
 # MediaPipe task bundles downloaded for live camera mode
 models/*.task
+
+# End-of-talk writeups
+reports/

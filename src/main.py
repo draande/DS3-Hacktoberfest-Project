@@ -13,17 +13,24 @@ from src.audio.pace_analyzer import PaceAnalyzer
 from src.audio.volume_analyzer import VolumeAnalyzer
 from src.capture.audio_stream import AudioCaptureError, MicrophoneStream
 from src.capture.video_stream import CameraUnavailable, FileVideoSource, WebcamSource
-from src.config_loader import AppConfig, load_config
+from src.config_loader import REPO_ROOT, AppConfig, load_config
 from src.controls.session_control import SessionControl
 from src.demo_scene import DemoScene
 from src.hud.display import detect_screen_size, prepare_display_frame
 from src.hud.renderer import HudRenderer, HudState, PreviewWindow
-from src.intelligence.gemma_client import CoachMetrics, GemmaClient
+from src.intelligence.gemma_client import (
+    CoachMetrics,
+    GemmaClient,
+    active_cues,
+    offline_insights,
+    render_report_markdown,
+)
+from src.intelligence.session_stats import SessionStats, save_report
 from src.vision.audience_tells import analyze_audience, tells_from_blendshapes
 from src.vision.gaze_tracker import GazeTracker
 from src.vision.gesture_detector import GestureDetector
 from src.vision.mediapipe_backend import MediaPipeBackend, download_models
-from src.vision.pose_tracker import analyze_posture
+from src.vision.pose_tracker import PostureCalibrator, analyze_posture
 
 
 @dataclass
@@ -52,6 +59,8 @@ class RunSummary:
     fallback: bool = True
     gemma_ok: int = 0
     gemma_failed: int = 0
+    gemma_avg: float | None = None
+    report: str = ""
     frames: int = 0
     duration: float = 0.0
     cues: list[tuple[float, str, str]] = field(default_factory=list)
@@ -149,9 +158,12 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
 def format_summary(summary: RunSummary) -> str:
     mode = "demo" if summary.demo else "live"
     coaching = "offline" if summary.fallback else "gemma"
+    latency = (
+        "" if summary.gemma_avg is None else f" gemma_avg={summary.gemma_avg:.1f}s"
+    )
     lines = [
         f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | "
-        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed} | "
+        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed}{latency} | "
         f"frames={summary.frames}"
     ]
     events = [
@@ -244,6 +256,7 @@ def run_session(
         history_seconds=app_config.gaze.history_seconds,
     )
     gestures = GestureDetector()
+    stats = SessionStats(window_seconds=45.0)
     if client is None:
         client = GemmaClient.from_env(
             model=app_config.gemma.model,
@@ -251,6 +264,8 @@ def run_session(
             offline=options.offline,
             min_interval=app_config.gemma.min_interval_seconds,
             timeout=app_config.gemma.timeout_seconds,
+            report_timeout=app_config.gemma.report_timeout_seconds,
+            max_output_tokens=app_config.gemma.max_output_tokens,
         )
     summary = RunSummary(
         demo=options.demo, theme=control.theme_name, fallback=client.used_fallback
@@ -260,6 +275,13 @@ def run_session(
     scene = (
         DemoScene(width, height, app_config.audio.sample_rate) if options.demo else None
     )
+    calibrator = None
+    if scene is None:
+        calibrator = PostureCalibrator(
+            warmup_seconds=app_config.posture.calibrate_seconds,
+            slouch_margin=app_config.posture.slouch_margin_degrees,
+            forward_margin=app_config.posture.forward_margin,
+        )
     video = None
     microphone = None
     backend = None
@@ -364,6 +386,8 @@ def run_session(
                 if pose_landmarks is not None
                 else None
             )
+            if posture is not None and calibrator is not None:
+                posture = calibrator.observe(posture, timestamp)
             gaze_state = gaze.update(face_landmarks, timestamp)
             if blendshapes:
                 audience = tells_from_blendshapes(blendshapes)
@@ -411,8 +435,17 @@ def run_session(
                 audience_surprised=False if audience is None else audience.surprised,
                 blendshapes={} if audience is None else dict(audience.blendshapes),
             )
-            proposal = client.poll(metrics)
-            active = control.filter.consider(proposal, timestamp)
+            stats.observe(
+                timestamp,
+                volume_reading.db,
+                pace_reading.wpm,
+                bool(gaze_state.cue),
+                bool(metrics.posture_alert),
+            )
+            client.poll(stats.recent(timestamp), timestamp)
+            active = control.filter.consider_many(
+                active_cues(metrics, app_config.cues.duration_ms), timestamp
+            )
             if control.filter.fired_at == timestamp and active is not None:
                 summary.cues.append(
                     (timestamp, active["cue_type"], active["display_text"])
@@ -420,10 +453,17 @@ def run_session(
                 renderer.sidebar.push(
                     active.get("bullets") or [active["display_text"]], timestamp
                 )
+                stats.note_cue(timestamp, active["cue_type"])
                 if active.get("audio_chime"):
                     summary.chimes += 1
                     if playback is not None and playback.active:
                         playback.play(chime_for_cue(active["cue_type"], sample_rate))
+
+            if client.bullets and client.status in {"gemma", "thinking"}:
+                insight_lines = client.bullets
+            else:
+                insight_lines = offline_insights(stats.recent(timestamp))
+            renderer.sidebar.push_insights(insight_lines, timestamp)
 
             remaining = max(0.0, timer_seconds - timestamp)
             ratio = remaining / timer_seconds if timer_seconds else 0.0
@@ -436,7 +476,8 @@ def run_session(
                     volume_db=volume_reading.db,
                     wpm=pace_reading.wpm,
                     pulse_t=timestamp,
-                    coaching_live=not client.used_fallback,
+                    coaching_status=client.status,
+                    level_threshold_db=control.effective_speak_up_db(),
                 ),
             )
             if summary.first_frame is None:
@@ -484,6 +525,18 @@ def run_session(
             preview.close()
         if playback is not None:
             playback.close()
+        window = stats.overall(summary.duration)
+        source, strengths, improve = client.report(window)
+        summary.report = render_report_markdown(window, strengths, improve, source)
+        try:
+            path = save_report(summary.report, REPO_ROOT / "reports")
+            summary.notes.append(f"report {path}")
+        except OSError as exc:
+            summary.notes.append(f"report was not saved ({exc})")
+        summary.gemma_ok = client.succeeded
+        summary.gemma_failed = client.failed
+        summary.gemma_avg = client.average_latency
+        summary.fallback = client.succeeded == 0
         client.close()
     return summary
 
@@ -515,4 +568,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if summary.error is None else 1
     summary = run_session(options)
     print(format_summary(summary))
+    if summary.report:
+        print()
+        print(summary.report)
     return 0 if summary.error is None else 1

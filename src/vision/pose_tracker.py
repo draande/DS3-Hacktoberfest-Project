@@ -7,7 +7,7 @@ and optional relative depth z (smaller z is closer to the camera).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -114,3 +114,51 @@ def analyze_posture(
         ear_forward_offset=forward,
         straighten=straighten,
     )
+
+
+class PostureCalibrator:
+    """Learn a laptop-webcam baseline, then cue on deviation from it.
+
+    The first ``warmup_seconds`` are the speaker's normal sitting posture.
+    A fixed 12° slouch line fires constantly when the camera looks up from
+    the keyboard. After the warmup, the straighten cue is the extra slouch
+    or forward-head past that baseline, and the warmup itself stays quiet.
+    """
+
+    def __init__(
+        self,
+        warmup_seconds: float = 3.0,
+        slouch_margin: float = 8.0,
+        forward_margin: float = 0.08,
+    ) -> None:
+        self.warmup_seconds = max(0.0, float(warmup_seconds))
+        self.slouch_margin = float(slouch_margin)
+        self.forward_margin = float(forward_margin)
+        self._slouches: list[float] = []
+        self._forwards: list[float] = []
+        self._t0: float | None = None
+        self.ready = False
+        self.baseline_slouch = 0.0
+        self.baseline_forward = 0.0
+
+    def observe(self, metrics: PostureMetrics, now: float) -> PostureMetrics:
+        if self._t0 is None:
+            self._t0 = float(now)
+        if not self.ready:
+            self._slouches.append(float(metrics.slouch_deg))
+            self._forwards.append(float(metrics.ear_forward_offset))
+            elapsed = float(now) - self._t0
+            if elapsed >= self.warmup_seconds and self._slouches:
+                ordered = sorted(self._slouches)
+                forwards = sorted(self._forwards)
+                mid = len(ordered) // 2
+                self.baseline_slouch = ordered[mid]
+                self.baseline_forward = forwards[mid]
+                self.ready = True
+            else:
+                return replace(metrics, straighten=False)
+        straighten = (
+            metrics.slouch_deg > self.baseline_slouch + self.slouch_margin
+            or metrics.ear_forward_offset > self.baseline_forward + self.forward_margin
+        )
+        return replace(metrics, straighten=straighten)

@@ -16,7 +16,13 @@ from src.hud.avatar import AvatarState, AvatarWidget
 from src.hud.display import configure_preview_window
 from src.hud.sidebar import FeedbackSidebar, draw_sidebar
 from src.hud.vignette import apply_vignette
-from src.hud.widgets import draw_widgets, layout_hud, widget_names_for_cue
+from src.hud.widgets import (
+    draw_mic_meter,
+    draw_widgets,
+    layout_hud,
+    mic_meter_box,
+    widget_names_for_cue,
+)
 
 
 @dataclass
@@ -27,7 +33,8 @@ class HudState:
     volume_db: float
     wpm: float
     pulse_t: float = 0.0
-    coaching_live: bool = False
+    coaching_status: str = "offline"
+    level_threshold_db: float = 42.0
 
 
 class HudRenderer:
@@ -84,6 +91,13 @@ class HudRenderer:
             state.remaining_seconds,
             state.volume_db,
         )
+        draw_mic_meter(
+            canvas,
+            mic_meter_box(canvas.shape[1], canvas.shape[0], self.sidebar_config),
+            state.volume_db,
+            state.level_threshold_db,
+            self.theme,
+        )
         cue = state.cue or {}
         draw_sidebar(
             canvas,
@@ -95,13 +109,14 @@ class HudRenderer:
                 theme_name=self.theme.key,
                 cue_type=None if not cue else str(cue.get("cue_type")),
                 display_text=None if not cue else str(cue.get("display_text") or ""),
-                speaking=state.volume_db >= 42.0,
+                speaking=state.volume_db >= state.level_threshold_db,
                 volume_db=state.volume_db,
                 wpm=state.wpm,
                 remaining_seconds=state.remaining_seconds,
             ),
             self.avatar_widget,
-            coaching_live=state.coaching_live,
+            coaching_status=state.coaching_status,
+            insights=self.sidebar.visible_insights(state.pulse_t),
         )
         if self.opacity >= 0.999:
             return canvas

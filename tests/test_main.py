@@ -44,7 +44,11 @@ def test_demo_loop_does_not_wait_for_a_slow_gemma_call():
         )
 
     client = GemmaClient(
-        api_key="test-key", transport=slow, min_interval=2.5, timeout=5
+        api_key="test-key",
+        transport=slow,
+        min_interval=2.5,
+        timeout=5,
+        report_timeout=0,
     )
     started = time.perf_counter()
     summary = run_session(
@@ -56,6 +60,7 @@ def test_demo_loop_does_not_wait_for_a_slow_gemma_call():
     assert summary.frames == 6
     assert summary.fallback is True
     assert "POSTURE" in summary.cue_types
+    assert "ENCOURAGE" not in summary.cue_types
 
 
 def test_parse_args_defaults_to_demo_and_live_camera_opts_out():

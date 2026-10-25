@@ -22,6 +22,7 @@ Useful flags:
 
 ```bash
 uv run python main.py --demo --duration 18 --fps 10 --width 640 --height 360
+uv run python main.py --camera 0 --display             # live cues, meter, Gemma insights
 uv run python main.py --demo --display                 # borderless fullscreen preview
 uv run python main.py --demo --timer 20 --display          # preview the edge vignette
 uv run python main.py --demo --theme minimalist
@@ -41,11 +42,21 @@ uv run python main.py --camera 0 --display
 
 `--video clip.mp4` plays a file instead of the webcam. Vision cues appear only after the models load. Audio cues need a working microphone; if PortAudio is missing, the HUD still runs and prints the reason.
 
-The microphone is opened at the device's own sample rate (often 48 kHz on Windows) and resampled to 16 kHz for the volume and pace math. A fixed 16 kHz mono capture is accepted by many devices and then never delivers samples. The input stream is also restarted once after open, because PortAudio can report it active while the callback never runs. Cue chimes play on a speaker stream at that device's rate. `--display` and live mode play those chimes. `--display` and `--chimes` also play the demo's scripted audio in real time. On Windows, if the mic stays closed, allow desktop apps under Settings → Privacy → Microphone. The pygame preview uses a dummy audio driver so it does not take the sound card away from PortAudio.
+The microphone is opened at the device's own sample rate (often 44.1 or 48 kHz) and resampled to 16 kHz for the volume and pace math. A fixed 16 kHz mono capture is accepted by many devices and then never delivers samples. The input stream is also restarted once after open, because PortAudio can report it active while the callback never runs. Cue chimes play on a speaker stream at that device's rate. `--display` and live mode play those chimes. `--display` and `--chimes` also play the demo's scripted audio in real time. On Windows, if the mic stays closed, allow desktop apps under Settings → Privacy → Microphone. The pygame preview uses a dummy audio driver so it does not take the sound card away from PortAudio.
+
+A level meter sits at the bottom of the HUD with a mark on the 42 dB speak-up line, so you can see the microphone working even when no volume cue is up. Live posture spends the first `posture.calibrate_seconds` (3s) learning how you sit in front of the laptop camera, then cues only when you slouch further than that baseline. A pinch has to be held for about 0.4s, with hysteresis on the finger gap, before it changes sensitivity.
+
+Posture, volume, pace, and gaze are decided on the device every frame. If several are true, the one that just appeared yields so another type can take the next slot. Gemma does not replace those cues.
 
 ## Gemma
 
-If `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` is set, Wingman asks Google Gemma for the cue JSON. The default model is `gemma-4-26b-a4b-it` (`gemma.model` in `config/default_config.yaml`). `GEMMA_MODEL` overrides that. Calls run on a background thread: at most one at a time, at least `gemma.min_interval_seconds` apart (2.5s), each limited by `gemma.timeout_seconds` (8s). The frame loop never waits. Until a reply arrives, and again while a call is in flight or after an error, the HUD keeps the deterministic offline cues. A small badge at the bottom of the sidebar reads `GEMMA` when the cue on screen came from the model and `OFFLINE` otherwise. The end summary includes `gemma_ok` and `gemma_failed`. A failed call logs one warning per distinct error. With no key, the offline coach is used and nothing is sent over the network. The test suite clears the key and model variables.
+Gemma writes two slow things: a trend every `gemma.min_interval_seconds` (18s) and a short report when the session ends. The default model is `gemma-4-26b-a4b-it`. `GEMMA_MODEL` overrides `gemma.model`. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable it. With no key, the same slots are filled locally and nothing is sent over the network.
+
+Each insight call sends a compact summary of the last 45 seconds (cue counts, average dB, WPM, gaze-away, posture), not the raw frame history. Output room is `gemma.max_output_tokens` (2048) so the model's thinking tokens do not come back as an empty reply. The client timeout defaults to 45 seconds and cannot be configured below 10, which the API rejects. A 429 or 504 backs off exponentially. Every call logs its latency, and the end summary includes `gemma_avg`.
+
+The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `GEMMA` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
+
+When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on either call. The test suite clears the key and model variables and uses fake transports.
 
 ## Hotkeys
 

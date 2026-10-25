@@ -8,10 +8,14 @@ timer:
   critical_ratio: 0.10
 
 posture:
-  # Straighten cue when slouch exceeds 12 degrees or the ears sit
-  # more than 15% of shoulder width in front of the shoulders.
+  # Absolute line used by the demo. Live mode calibrates a baseline from
+  # the first few seconds and cues on deviation past the margins below,
+  # because a laptop webcam looks up and a fixed 12° line never goes quiet.
   slouch_degrees: 12.0
   ear_forward_offset: 0.15
+  calibrate_seconds: 3.0
+  slouch_margin_degrees: 8.0
+  forward_margin: 0.08
 
 gaze:
   # Prolonged fixation away from the audience.
@@ -89,6 +93,10 @@ audio:
 gemma:
   # gemma-3-12b-it returns 404 on AI Studio v1beta. Override with GEMMA_MODEL.
   model: gemma-4-26b-a4b-it
-  # The frame loop does not wait on Gemma. One call at a time, then this gap.
-  min_interval_seconds: 2.5
-  timeout_seconds: 8
+  # Insights only. Real-time cues do not wait on this. Google rejects
+  # deadlines under 10s, and this model often takes 16-24s.
+  min_interval_seconds: 18
+  timeout_seconds: 45
+  report_timeout_seconds: 90
+  # Thinking tokens on gemma-4 consume a small cap and return empty text.
+  max_output_tokens: 2048

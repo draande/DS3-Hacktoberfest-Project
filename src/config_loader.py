@@ -24,6 +24,9 @@ class TimerConfig:
 class PostureConfig:
     slouch_degrees: float = 12.0
     ear_forward_offset: float = 0.15
+    calibrate_seconds: float = 3.0
+    slouch_margin_degrees: float = 8.0
+    forward_margin: float = 0.08
 
 
 @dataclasses.dataclass
@@ -107,8 +110,10 @@ class AudioStreamConfig:
 @dataclasses.dataclass
 class GemmaConfig:
     model: str = "gemma-4-26b-a4b-it"
-    min_interval_seconds: float = 2.5
-    timeout_seconds: float = 8.0
+    min_interval_seconds: float = 18.0
+    timeout_seconds: float = 45.0
+    report_timeout_seconds: float = 90.0
+    max_output_tokens: int = 2048
 
 
 @dataclasses.dataclass
@@ -216,8 +221,24 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("hud.sidebar.fade_seconds must be shorter than ttl_seconds")
     if float(config.gemma.min_interval_seconds) <= 0:
         raise ValueError("gemma.min_interval_seconds must be positive")
-    if float(config.gemma.timeout_seconds) <= 0:
-        raise ValueError("gemma.timeout_seconds must be positive")
+    if float(config.gemma.timeout_seconds) < 10:
+        raise ValueError(
+            "gemma.timeout_seconds must be at least 10 seconds; "
+            "shorter deadlines are rejected by the API"
+        )
+    if float(config.gemma.report_timeout_seconds) < 10:
+        raise ValueError("gemma.report_timeout_seconds must be at least 10 seconds")
+    if int(config.gemma.max_output_tokens) < 512:
+        raise ValueError(
+            "gemma.max_output_tokens must be at least 512 so thinking tokens "
+            "do not consume the whole reply"
+        )
+    if float(config.posture.calibrate_seconds) < 0:
+        raise ValueError("posture.calibrate_seconds cannot be negative")
+    if float(config.posture.slouch_margin_degrees) <= 0:
+        raise ValueError("posture.slouch_margin_degrees must be positive")
+    if float(config.posture.forward_margin) <= 0:
+        raise ValueError("posture.forward_margin must be positive")
     if config.hud.avatar.anchor != "sidebar_top":
         raise ValueError("hud.avatar.anchor must be 'sidebar_top'")
     if not 0 < float(config.hud.avatar.height_ratio) <= 1:
