@@ -87,4 +87,8 @@ audio:
   buffer_seconds: 2.5
 
 gemma:
-  model: gemma-3-12b-it
+  # gemma-3-12b-it returns 404 on AI Studio v1beta. Override with GEMMA_MODEL.
+  model: gemma-4-26b-a4b-it
+  # The frame loop does not wait on Gemma. One call at a time, then this gap.
+  min_interval_seconds: 2.5
+  timeout_seconds: 8

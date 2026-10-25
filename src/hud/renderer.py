@@ -27,6 +27,7 @@ class HudState:
     volume_db: float
     wpm: float
     pulse_t: float = 0.0
+    coaching_live: bool = False
 
 
 class HudRenderer:
@@ -100,6 +101,7 @@ class HudRenderer:
                 remaining_seconds=state.remaining_seconds,
             ),
             self.avatar_widget,
+            coaching_live=state.coaching_live,
         )
         if self.opacity >= 0.999:
             return canvas

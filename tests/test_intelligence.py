@@ -1,5 +1,10 @@
+import logging
+import time
+
+from src.config_loader import GemmaConfig, load_config
 from src.intelligence.cue_filter import CueFilter
 from src.intelligence.gemma_client import (
+    DEFAULT_MODEL,
     CoachMetrics,
     GemmaClient,
     build_prompt,
@@ -9,6 +14,20 @@ from src.intelligence.gemma_client import (
     offline_cue,
     parse_cue_json,
 )
+
+_ENCOURAGE = (
+    '{"priority":"LOW","cue_type":"ENCOURAGE","display_text":"Great pace",'
+    '"icon":"ok","duration_ms":2000,"audio_chime":false}'
+)
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out waiting for the Gemma worker")
 
 
 def test_offline_fallback_ranks_posture_then_volume_then_pace():
@@ -134,6 +153,105 @@ def test_client_uses_transport_json_and_falls_back_when_it_is_garbage():
     quiet = GemmaClient(api_key=None)
     assert quiet.arbitrate(CoachMetrics()) is None
     assert quiet.used_fallback is True
+
+
+def test_gemma_model_env_overrides_the_config(monkeypatch):
+    assert GemmaConfig().model == DEFAULT_MODEL == "gemma-4-26b-a4b-it"
+    assert load_config().gemma.model == DEFAULT_MODEL
+    monkeypatch.setenv("GEMMA_MODEL", "gemma-custom-model")
+    overridden = GemmaClient.from_env(load_config().gemma.model, 3000, offline=True)
+    assert overridden.model == "gemma-custom-model"
+    monkeypatch.setenv("GEMMA_MODEL", "   ")
+    blank = GemmaClient.from_env(DEFAULT_MODEL, 3000, offline=True)
+    assert blank.model == DEFAULT_MODEL
+
+
+def test_poll_does_not_block_on_a_slow_transport():
+    def slow(_prompt: str) -> str:
+        time.sleep(1.5)
+        return _ENCOURAGE
+
+    client = GemmaClient(api_key="test-key", transport=slow, min_interval=0, timeout=5)
+    metrics = CoachMetrics(posture_alert=True)
+    started = time.perf_counter()
+    cues = [client.poll(metrics, now=float(i)) for i in range(12)]
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.5
+    assert client.pending is True
+    assert all(cue["cue_type"] == "POSTURE" for cue in cues)
+    client.close()
+
+
+def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
+    caplog.set_level(logging.WARNING, logger="wingman.gemma")
+    metrics = CoachMetrics(posture_alert=True)
+    good = GemmaClient(
+        api_key="test-key",
+        transport=lambda _prompt: _ENCOURAGE,
+        min_interval=2,
+        timeout=2,
+    )
+    assert good.poll(metrics, now=0)["cue_type"] == "POSTURE"
+    _wait_until(lambda: not good.pending)
+    shown = good.poll(metrics, now=0.2)
+    assert shown["cue_type"] == "ENCOURAGE"
+    assert good.succeeded == 1
+    assert good.failed == 0
+    assert good.used_fallback is False
+    assert good.pending is False
+
+    def raise_404(_prompt: str) -> str:
+        error = RuntimeError("NOT_FOUND")
+        error.code = 404
+        raise error
+
+    bad = GemmaClient(
+        api_key="test-key", transport=raise_404, min_interval=1, timeout=2
+    )
+    bad.poll(metrics, now=0)
+    _wait_until(lambda: bad.failed >= 1 and not bad.pending)
+    assert bad.poll(metrics, now=0.1)["cue_type"] == "POSTURE"
+    assert bad.used_fallback is True
+    bad.poll(metrics, now=5)
+    _wait_until(lambda: bad.failed >= 2 and not bad.pending)
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "wingman.gemma"
+    ]
+    assert warnings == ["Gemma call failed: 404 NOT_FOUND"]
+    assert bad.succeeded == 0
+
+    messy = GemmaClient(
+        api_key="test-key",
+        transport=lambda _prompt: "not json",
+        min_interval=0,
+        timeout=2,
+    )
+    messy.poll(CoachMetrics(), now=0)
+    _wait_until(lambda: messy.failed >= 1 and not messy.pending)
+    assert messy.failed == 1
+    assert any("unparseable" in record.getMessage() for record in caplog.records)
+
+
+def test_a_timed_out_call_is_a_failure_and_poll_does_not_wait_for_it():
+    def slow(_prompt: str) -> str:
+        time.sleep(0.6)
+        return _ENCOURAGE
+
+    client = GemmaClient(
+        api_key="test-key", transport=slow, min_interval=5, timeout=0.15
+    )
+    started = time.perf_counter()
+    cue = client.poll(CoachMetrics(posture_alert=True), now=0)
+    assert cue["cue_type"] == "POSTURE"
+    assert time.perf_counter() - started < 0.15
+    _wait_until(lambda: client.failed >= 1, timeout=1)
+    assert time.perf_counter() - started < 0.45
+    _wait_until(lambda: not client.pending, timeout=2)
+    assert client.failed == 1
+    assert client.succeeded == 0
+    client.close()
 
 
 def test_none_priority_from_the_model_suppresses_the_cue():

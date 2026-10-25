@@ -49,6 +49,8 @@ class RunSummary:
     demo: bool = True
     theme: str = "ironman"
     fallback: bool = True
+    gemma_ok: int = 0
+    gemma_failed: int = 0
     frames: int = 0
     duration: float = 0.0
     cues: list[tuple[float, str, str]] = field(default_factory=list)
@@ -147,7 +149,9 @@ def format_summary(summary: RunSummary) -> str:
     mode = "demo" if summary.demo else "live"
     coaching = "offline" if summary.fallback else "gemma"
     lines = [
-        f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | frames={summary.frames}"
+        f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | "
+        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed} | "
+        f"frames={summary.frames}"
     ]
     events = [
         (timestamp, f"t={timestamp:05.2f} {cue_type} {text}")
@@ -165,7 +169,11 @@ def format_summary(summary: RunSummary) -> str:
     return "\n".join(lines)
 
 
-def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSummary:
+def run_session(
+    options: RunOptions,
+    config: AppConfig | None = None,
+    client: GemmaClient | None = None,
+) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
         paths = download_models()
@@ -235,11 +243,14 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
         history_seconds=app_config.gaze.history_seconds,
     )
     gestures = GestureDetector()
-    client = GemmaClient.from_env(
-        model=app_config.gemma.model,
-        duration_ms=app_config.cues.duration_ms,
-        offline=options.offline,
-    )
+    if client is None:
+        client = GemmaClient.from_env(
+            model=app_config.gemma.model,
+            duration_ms=app_config.cues.duration_ms,
+            offline=options.offline,
+            min_interval=app_config.gemma.min_interval_seconds,
+            timeout=app_config.gemma.timeout_seconds,
+        )
     summary = RunSummary(
         demo=options.demo, theme=control.theme_name, fallback=client.used_fallback
     )
@@ -268,6 +279,7 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 )
         except (CameraUnavailable, FileNotFoundError, RuntimeError) as exc:
             summary.error = str(exc)
+            client.close()
             return summary
         microphone = MicrophoneStream(
             sample_rate=app_config.audio.sample_rate,
@@ -387,7 +399,7 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 audience_surprised=False if audience is None else audience.surprised,
                 blendshapes={} if audience is None else dict(audience.blendshapes),
             )
-            proposal = client.arbitrate(metrics)
+            proposal = client.poll(metrics)
             active = control.filter.consider(proposal, timestamp)
             if control.filter.fired_at == timestamp and active is not None:
                 summary.cues.append(
@@ -413,6 +425,7 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                     volume_db=volume_reading.db,
                     wpm=pace_reading.wpm,
                     pulse_t=timestamp,
+                    coaching_live=not client.used_fallback,
                 ),
             )
             if summary.first_frame is None:
@@ -421,6 +434,8 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
             summary.frames = frame_index + 1
             summary.duration = timestamp
             summary.fallback = client.used_fallback
+            summary.gemma_ok = client.succeeded
+            summary.gemma_failed = client.failed
             summary.theme = control.theme_name
 
             if preview is not None:
@@ -447,6 +462,7 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
             backend.close()
         if preview is not None:
             preview.close()
+        client.close()
     return summary
 
 

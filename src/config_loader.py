@@ -106,7 +106,9 @@ class AudioStreamConfig:
 
 @dataclasses.dataclass
 class GemmaConfig:
-    model: str = "gemma-3-12b-it"
+    model: str = "gemma-4-26b-a4b-it"
+    min_interval_seconds: float = 2.5
+    timeout_seconds: float = 8.0
 
 
 @dataclasses.dataclass
@@ -212,6 +214,10 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("hud.sidebar.fade_seconds cannot be negative")
     if float(config.hud.sidebar.fade_seconds) >= float(config.hud.sidebar.ttl_seconds):
         raise ValueError("hud.sidebar.fade_seconds must be shorter than ttl_seconds")
+    if float(config.gemma.min_interval_seconds) <= 0:
+        raise ValueError("gemma.min_interval_seconds must be positive")
+    if float(config.gemma.timeout_seconds) <= 0:
+        raise ValueError("gemma.timeout_seconds must be positive")
     if config.hud.avatar.anchor != "sidebar_top":
         raise ValueError("hud.avatar.anchor must be 'sidebar_top'")
     if not 0 < float(config.hud.avatar.height_ratio) <= 1:

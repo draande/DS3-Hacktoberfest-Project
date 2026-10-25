@@ -4,7 +4,7 @@ import pytest
 from src.config_loader import SidebarConfig, load_config
 from src.hud.avatar import AvatarState, draw_avatar
 from src.hud.renderer import HudRenderer, HudState
-from src.hud.sidebar import FeedbackSidebar
+from src.hud.sidebar import FeedbackSidebar, coaching_badge_rect
 from src.hud.vignette import (
     apply_vignette,
     edge_mask,
@@ -230,6 +230,33 @@ def test_renderer_paints_the_sidebar_for_both_themes():
         )
         strip = rendered[:, panel.x : panel.x + panel.w]
         assert int(strip.max()) > 0
+
+
+def test_coaching_badge_switches_between_gemma_and_offline():
+    config = load_config()
+    theme = config.theme("ironman")
+    renderer = HudRenderer(
+        theme,
+        opacity=1.0,
+        sidebar_config=config.hud.sidebar,
+        avatar_config=config.hud.avatar,
+    )
+    frame = np.zeros((180, 320, 3), np.uint8)
+    kwargs = dict(
+        remaining_seconds=10, remaining_ratio=0.8, cue=None, volume_db=50, wpm=140
+    )
+    live = renderer.render(frame.copy(), HudState(**kwargs, coaching_live=True))
+    offline = renderer.render(frame.copy(), HudState(**kwargs, coaching_live=False))
+    _boxes, panel, _avatar = layout_hud(
+        320, 180, ["timer"], renderer.sidebar_config, renderer.avatar_config
+    )
+    x, y, _w, _h = coaching_badge_rect(panel)
+    assert tuple(int(channel) for channel in live[y, x + 2]) == hex_to_bgr(
+        theme.colors["primary"]
+    )
+    assert tuple(int(channel) for channel in offline[y, x + 2]) == hex_to_bgr(
+        theme.colors["neutral"]
+    )
 
 
 def test_pygame_surface_matches_the_frame_size():

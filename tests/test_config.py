@@ -24,6 +24,9 @@ def test_default_config_loads_plan_thresholds():
     assert config.timer.duration_seconds == 300
     assert config.audio.sample_rate == 16000
     assert config.hud.fps == 30
+    assert config.gemma.model == "gemma-4-26b-a4b-it"
+    assert config.gemma.min_interval_seconds == 2.5
+    assert config.gemma.timeout_seconds == 8
     assert config.hud.theme == "ironman"
     assert config.hud.sidebar.side == "right"
     assert config.hud.sidebar.max_bullets == 4
@@ -50,7 +53,7 @@ def test_themes_match_the_spec_palettes():
 def test_load_config_is_independent_of_the_working_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     config = load_config()
-    assert config.gemma.model == "gemma-3-12b-it"
+    assert config.gemma.model == "gemma-4-26b-a4b-it"
 
 
 def test_unknown_theme_is_rejected(tmp_path):

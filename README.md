@@ -43,7 +43,7 @@ uv run python main.py --camera 0 --display
 
 ## Gemma
 
-If `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` is set, Wingman asks Google Gemma (`gemma-3-12b-it` by default, override with `GEMMA_MODEL`) for the cue JSON. With no key, or when the response is not valid JSON, a deterministic offline coach emits the same schema. The test suite clears those variables so it never calls the network.
+If `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` is set, Wingman asks Google Gemma for the cue JSON. The default model is `gemma-4-26b-a4b-it` (`gemma.model` in `config/default_config.yaml`). `GEMMA_MODEL` overrides that. Calls run on a background thread: at most one at a time, at least `gemma.min_interval_seconds` apart (2.5s), each limited by `gemma.timeout_seconds` (8s). The frame loop never waits. Until a reply arrives, and again while a call is in flight or after an error, the HUD keeps the deterministic offline cues. A small badge at the bottom of the sidebar reads `GEMMA` when the cue on screen came from the model and `OFFLINE` otherwise. The end summary includes `gemma_ok` and `gemma_failed`. A failed call logs one warning per distinct error. With no key, the offline coach is used and nothing is sent over the network. The test suite clears the key and model variables.
 
 ## Hotkeys
 

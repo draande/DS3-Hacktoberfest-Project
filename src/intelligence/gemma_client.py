@@ -8,9 +8,16 @@ the prompt describes and returns the HUD JSON schema from PLAN.md.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass, field
+
+logger = logging.getLogger("wingman.gemma")
+
+DEFAULT_MODEL = "gemma-4-26b-a4b-it"
 
 CUE_KEYS = (
     "priority",
@@ -124,6 +131,23 @@ def bullets_for_display(display_text: str, raw=None) -> list[str]:
     return [fallback] if fallback else []
 
 
+def resolve_model(config_model: str) -> str:
+    """``GEMMA_MODEL`` wins over the YAML model. A blank value does not."""
+    override = os.environ.get("GEMMA_MODEL", "").strip()
+    return override or config_model
+
+
+def format_gemma_error(exc: BaseException) -> str:
+    """One line with the status code and message, when the exception has them."""
+    code = getattr(exc, "code", None)
+    if code is None:
+        code = getattr(exc, "status_code", None)
+    detail = " ".join(str(exc).split()) or exc.__class__.__name__
+    if code is not None and str(code) not in detail.split():
+        return f"{code} {detail}"
+    return detail
+
+
 def resolve_api_key(explicit: str | None = None) -> str | None:
     if explicit:
         return explicit
@@ -232,54 +256,213 @@ def offline_cue(metrics: CoachMetrics, duration_ms: int = 3000) -> dict | None:
 
 
 class GemmaClient:
+    """Cue client. ``arbitrate`` is synchronous. ``poll`` never blocks the caller.
+
+    ``poll`` keeps at most one request in flight, waits ``min_interval`` seconds
+    between submits, and times out each call. The frame loop reads the latest
+    finished result. Until that result exists, and again after an error or
+    while a call is still running, ``poll`` returns the offline cue.
+    """
+
     def __init__(
         self,
-        model: str = "gemma-3-12b-it",
+        model: str = DEFAULT_MODEL,
         api_key: str | None = None,
         duration_ms: int = 3000,
         transport=None,
+        min_interval: float = 2.5,
+        timeout: float = 8.0,
+        offline: bool = False,
     ) -> None:
+        if min_interval < 0:
+            raise ValueError("min_interval must be >= 0")
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
         self.model = model
         self.api_key = api_key
         self.duration_ms = duration_ms
         self.transport = transport
-        self.used_fallback = api_key is None and transport is None
+        self.min_interval = float(min_interval)
+        self.timeout = float(timeout)
+        self.offline = offline or (api_key is None and transport is None)
+        self.used_fallback = True
+        self._lock = threading.Lock()
+        self._pending = False
+        self._live = False
+        self._cue: dict | None = None
+        self._succeeded = 0
+        self._failed = 0
+        self._seen_errors: set[str] = set()
+        self._last_submit: float | None = None
+        self._job_id = 0
+        self._settled: set[int] = set()
+        self._closed = False
 
     @classmethod
     def from_env(
-        cls, model: str, duration_ms: int, offline: bool = False
+        cls,
+        model: str,
+        duration_ms: int,
+        offline: bool = False,
+        min_interval: float = 2.5,
+        timeout: float = 8.0,
     ) -> GemmaClient:
         api_key = None if offline else resolve_api_key()
-        return cls(model=model, api_key=api_key, duration_ms=duration_ms)
+        return cls(
+            model=resolve_model(model),
+            api_key=api_key,
+            duration_ms=duration_ms,
+            min_interval=min_interval,
+            timeout=timeout,
+            offline=offline,
+        )
+
+    @property
+    def succeeded(self) -> int:
+        with self._lock:
+            return self._succeeded
+
+    @property
+    def failed(self) -> int:
+        with self._lock:
+            return self._failed
+
+    @property
+    def pending(self) -> bool:
+        with self._lock:
+            return self._pending
 
     def arbitrate(self, metrics: CoachMetrics) -> dict | None:
-        if self.transport is not None:
-            parsed = parse_cue_json(self.transport(build_prompt(metrics)))
-            if parsed is None:
-                self.used_fallback = True
-                return offline_cue(metrics, self.duration_ms)
-            if parsed["priority"] == "NONE" or parsed["cue_type"] == "NONE":
-                return None
-            return parsed
-        if not self.api_key:
+        """Blocking call used by tests and by the worker thread."""
+        if self.offline or (self.transport is None and not self.api_key):
             self.used_fallback = True
             return offline_cue(metrics, self.duration_ms)
         try:
-            parsed = parse_cue_json(self._call_google(build_prompt(metrics)))
-        except Exception:
+            cue = self._evaluate(metrics)
+        except Exception as exc:
+            self._note_failure(exc)
+            return offline_cue(metrics, self.duration_ms)
+        self._note_success(cue)
+        self.used_fallback = False
+        return cue
+
+    def poll(self, metrics: CoachMetrics, now: float | None = None) -> dict | None:
+        """Return a cue immediately. Never waits on the network."""
+        if not self.offline and (self.transport is not None or self.api_key):
+            self._maybe_start(metrics, time.monotonic() if now is None else float(now))
+        with self._lock:
+            pending = self._pending
+            live = self._live
+            cue = self._cue
+        if pending or not live:
             self.used_fallback = True
             return offline_cue(metrics, self.duration_ms)
+        self.used_fallback = False
+        return cue
+
+    def close(self) -> None:
+        """Stop submitting. In-flight calls are daemon threads and are not joined."""
+        with self._lock:
+            self._closed = True
+
+    def _maybe_start(self, metrics: CoachMetrics, now: float) -> None:
+        with self._lock:
+            if self._closed or self._pending:
+                return
+            if (
+                self._last_submit is not None
+                and now - self._last_submit < self.min_interval
+            ):
+                return
+            self._pending = True
+            self._last_submit = now
+            self._job_id += 1
+            job_id = self._job_id
+        threading.Thread(
+            target=self._worker,
+            args=(metrics, job_id),
+            name="wingman-gemma",
+            daemon=True,
+        ).start()
+
+    def _worker(self, metrics: CoachMetrics, job_id: int) -> None:
+        done = threading.Event()
+        box: dict = {}
+
+        def invoke() -> None:
+            try:
+                box["cue"] = self._evaluate(metrics)
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=invoke, name="wingman-gemma-call", daemon=True).start()
+        if not done.wait(self.timeout):
+            self._note_failure(
+                TimeoutError(f"timed out after {self.timeout:.1f}s"), job_id
+            )
+            done.wait()
+        elif "error" in box:
+            self._note_failure(box["error"], job_id)
+        else:
+            self._note_success(box.get("cue"), job_id)
+        with self._lock:
+            if self._job_id == job_id:
+                self._pending = False
+
+    def _evaluate(self, metrics: CoachMetrics) -> dict | None:
+        parsed = parse_cue_json(self._fetch(build_prompt(metrics)))
         if parsed is None:
-            self.used_fallback = True
-            return offline_cue(metrics, self.duration_ms)
+            raise ValueError("unparseable Gemma response")
         if parsed["priority"] == "NONE" or parsed["cue_type"] == "NONE":
             return None
-        self.used_fallback = False
         return parsed
+
+    def _fetch(self, prompt: str) -> str:
+        if self.transport is not None:
+            return self.transport(prompt)
+        return self._call_google(prompt)
+
+    def _note_success(self, cue: dict | None, job_id: int | None = None) -> None:
+        with self._lock:
+            if not self._claim(job_id):
+                return
+            self._succeeded += 1
+            self._live = True
+            self._cue = cue
+
+    def _note_failure(self, exc: BaseException, job_id: int | None = None) -> None:
+        line = format_gemma_error(exc)
+        with self._lock:
+            if not self._claim(job_id):
+                return
+            self._failed += 1
+            self._live = False
+            self._cue = None
+            self.used_fallback = True
+            fresh = line not in self._seen_errors
+            if fresh:
+                self._seen_errors.add(line)
+        if fresh:
+            logger.warning("Gemma call failed: %s", line)
+
+    def _claim(self, job_id: int | None) -> bool:
+        if job_id is None:
+            return True
+        if job_id != self._job_id or job_id in self._settled:
+            return False
+        self._settled.add(job_id)
+        return True
 
     def _call_google(self, prompt: str) -> str:
         from google import genai
+        from google.genai import types
 
-        client = genai.Client(api_key=self.api_key)
+        timeout_ms = max(1, int(self.timeout * 1000))
+        client = genai.Client(
+            api_key=self.api_key,
+            http_options=types.HttpOptions(timeout=timeout_ms),
+        )
         response = client.models.generate_content(model=self.model, contents=prompt)
         return response.text or ""

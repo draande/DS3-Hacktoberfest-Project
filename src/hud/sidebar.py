@@ -57,6 +57,17 @@ class FeedbackSidebar:
         return shown
 
 
+def coaching_badge_rect(panel: WidgetBox) -> tuple[int, int, int, int]:
+    """Small strip at the bottom of the sidebar: GEMMA when live, OFFLINE otherwise."""
+    height = 16 if panel.h >= 40 else max(4, panel.h // 5)
+    height = min(height, max(1, panel.h))
+    inset = 2 if panel.w > 8 else 0
+    width = max(1, panel.w - 2 * inset)
+    x = panel.x + inset if panel.w > width else panel.x
+    y = panel.y + panel.h - height
+    return int(x), int(y), int(width), int(height)
+
+
 def draw_sidebar(
     image: np.ndarray,
     panel: WidgetBox,
@@ -65,6 +76,7 @@ def draw_sidebar(
     theme: Theme,
     avatar_state: AvatarState,
     avatar_widget: AvatarWidget,
+    coaching_live: bool = False,
 ) -> None:
     """Fill the side panel, paint the avatar slot, then the bullet lines."""
     if panel.w <= 1 or panel.h <= 1:
@@ -77,6 +89,7 @@ def draw_sidebar(
         avatar_state,
     )
     _draw_bullets(image, panel, avatar_box, bullets, theme)
+    _draw_coaching_badge(image, panel, theme, coaching_live)
 
 
 def _fill_panel(image: np.ndarray, panel: WidgetBox, theme: Theme) -> None:
@@ -133,7 +146,8 @@ def _draw_bullets(
     line_h = max(14, int(round(28 * scale)))
     x = panel.x + max(6, panel.w // 18)
     y = avatar_box.y + avatar_box.h + line_h
-    bottom = panel.y + panel.h - 6
+    _badge_x, badge_y, _badge_w, _badge_h = coaching_badge_rect(panel)
+    bottom = min(panel.y + panel.h - 6, badge_y - 4)
     for text, alpha in bullets:
         if y > bottom:
             break
@@ -151,3 +165,33 @@ def _draw_bullets(
             cv2.LINE_AA,
         )
         y += line_h
+
+
+def _draw_coaching_badge(
+    image: np.ndarray, panel: WidgetBox, theme: Theme, live: bool
+) -> None:
+    x, y, width, height = coaching_badge_rect(panel)
+    frame_h, frame_w = image.shape[:2]
+    x1 = min(frame_w, x + width)
+    y1 = min(frame_h, y + height)
+    x0 = max(0, min(x, frame_w))
+    y0 = max(0, min(y, frame_h))
+    if x1 <= x0 or y1 <= y0:
+        return
+    role = "primary" if live else "neutral"
+    color = hex_to_bgr(theme.colors.get(role, "#FFFFFF" if live else "#7A8B99"))
+    cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), color, -1)
+    if height < 12 or width < 36:
+        return
+    label = "GEMMA" if live else "OFFLINE"
+    text = hex_to_bgr(theme.colors.get("background", "#000000"))
+    cv2.putText(
+        image,
+        label,
+        (x0 + 4, y1 - 4),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        text,
+        1,
+        cv2.LINE_AA,
+    )
