@@ -1,0 +1,28 @@
+# HUD themes. Colors are RGB hex. Section 5 specifies Ironman and Minimalist.
+# The module tree mentions a Cyberpunk skin, but no palette is defined for it.
+
+ironman:
+  name: Ironman Jarvis HUD
+  font: monospace
+  brackets: true
+  opacity: 0.9
+  colors:
+    primary: "#00F0FF"
+    warning: "#FFB800"
+    alert: "#FF003C"
+    background: "#001018"
+    text: "#E8FBFF"
+    neutral: "#7A8B99"
+
+minimalist:
+  name: Minimalist Meta Glass
+  font: sans
+  brackets: false
+  opacity: 0.85
+  colors:
+    primary: "#FFFFFF"
+    warning: "#FFA500"
+    alert: "#FF3B30"
+    background: "#000000"
+    text: "#FFFFFF"
+    neutral: "#C8C8C8"
