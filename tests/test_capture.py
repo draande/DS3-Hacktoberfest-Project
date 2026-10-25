@@ -6,6 +6,7 @@ import pytest
 from src.capture.audio_stream import (
     MicrophoneStream,
     RingBuffer,
+    StreamResampler,
     SyntheticAudioSource,
     block_latency_ms,
     sine_generator,
@@ -134,6 +135,114 @@ def test_file_video_round_trip(tmp_path):
     source.close()
     assert len(frames) == 5
     assert frames[1].timestamp == pytest.approx(0.1)
+
+
+def test_resampler_keeps_level_and_joins_chunks():
+    source_rate = 48000
+    target_rate = 16000
+    seconds = 0.25
+    times = np.arange(int(seconds * source_rate)) / source_rate
+    tone = (0.25 * np.sin(2 * np.pi * 440.0 * times)).astype(np.float32)
+    whole = StreamResampler(source_rate, target_rate).process(tone)
+    joined = []
+    chunked = StreamResampler(source_rate, target_rate)
+    for piece in np.array_split(tone, 8):
+        joined.append(chunked.process(piece))
+    stitched = np.concatenate(joined) if joined else np.zeros(0, np.float32)
+    assert whole.size == pytest.approx(seconds * target_rate, abs=5)
+    count = min(whole.size, stitched.size)
+    assert count > 1000
+    assert np.allclose(whole[:count], stitched[:count], atol=1e-5)
+    assert float(np.max(np.abs(whole))) == pytest.approx(0.25, abs=0.02)
+
+
+def test_microphone_opens_at_the_device_rate_and_returns_16k():
+    class FakeInput:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+            self.kwargs = None
+            self.callback = None
+
+        def query_devices(self, kind=None):
+            assert kind == "input"
+            return {
+                "default_samplerate": 48000.0,
+                "max_input_channels": 2,
+                "name": "mic",
+            }
+
+        def InputStream(self, **kwargs):
+            self.calls.append(kwargs["channels"])
+            if kwargs["channels"] == 1:
+                raise OSError("Invalid number of channels")
+            self.kwargs = kwargs
+            self.callback = kwargs["callback"]
+            return self
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    device = FakeInput()
+    device.events = []
+    device.start = lambda: device.events.append("start")
+    device.stop = lambda: device.events.append("stop")
+    mic = MicrophoneStream(sample_rate=16000, buffer_seconds=1.0)
+    mic.start(sd_module=device)
+    assert device.calls == [2]
+    assert device.kwargs["samplerate"] == 48000
+    assert device.kwargs["blocksize"] == 768
+    # The first start() alone leaves the callback silent on PortAudio.
+    assert device.events[:3] == ["start", "stop", "start"]
+    stereo = np.zeros((4800, 2), np.float32)
+    stereo[:, 0] = 0.4
+    device.callback(stereo, 4800, None, None)
+    chunk = mic.pop_ready()
+    mic.close()
+    assert chunk.sample_rate == 16000
+    assert chunk.samples.size == pytest.approx(1600, abs=5)
+    assert float(np.mean(chunk.samples)) == pytest.approx(0.2, abs=0.02)
+
+
+def test_microphone_falls_back_to_mono_when_stereo_is_refused():
+    class MonoOnly:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def query_devices(self, kind=None):
+            return {
+                "default_samplerate": 48000.0,
+                "max_input_channels": 2,
+                "name": "mic",
+            }
+
+        def InputStream(self, **kwargs):
+            self.calls.append(kwargs["channels"])
+            if kwargs["channels"] != 1:
+                raise OSError("stereo refused")
+            return self
+
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    device = MonoOnly()
+    mic = MicrophoneStream(sample_rate=16000)
+    mic.start(sd_module=device)
+    # Stereo is tried at the 16 ms block and again with PortAudio's period
+    # before the open falls back to mono.
+    assert device.calls == [2, 2, 1]
+    mic.close()
 
 
 def test_microphone_reports_missing_portaudio(monkeypatch):

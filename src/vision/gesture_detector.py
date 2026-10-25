@@ -42,33 +42,54 @@ def is_open_palm(landmarks: np.ndarray) -> bool:
     return finger_extended(points, THUMB_TIP, THUMB_IP, ratio=1.05)
 
 
-def is_pinch(landmarks: np.ndarray, ratio: float = 0.45) -> bool:
+def pinch_ratio(landmarks: np.ndarray) -> float:
+    """Thumb-to-index gap divided by palm size. Smaller means a tighter pinch."""
     points = np.asarray(landmarks, dtype=np.float64)
     palm = max(_distance(points[MIDDLE_MCP], points[WRIST]), 1e-6)
     gap = _distance(points[THUMB_TIP], points[INDEX_TIP])
-    return gap / palm < ratio
+    return gap / palm
+
+
+def is_pinch(landmarks: np.ndarray, ratio: float = 0.45) -> bool:
+    return pinch_ratio(landmarks) < ratio
 
 
 class GestureDetector:
-    """Detect a raised open palm, a pinch, and horizontal swipes."""
+    """Detect a raised open palm, a pinch, and horizontal swipes.
+
+    Pinch uses hysteresis: it engages below ``pinch_on`` and stays engaged
+    until the gap opens past ``pinch_off``. A one-frame flicker does not
+    count as a pinch.
+    """
 
     def __init__(
         self,
         swipe_distance: float = 0.12,
         swipe_window: float = 0.35,
         raised_y: float = 0.55,
+        pinch_on: float = 0.35,
+        pinch_off: float = 0.55,
     ) -> None:
         self.swipe_distance = swipe_distance
         self.swipe_window = swipe_window
         self.raised_y = raised_y
+        self.pinch_on = pinch_on
+        self.pinch_off = pinch_off
         self._history: list[tuple[float, float]] = []
+        self._pinch_active = False
 
     def update(self, landmarks: np.ndarray | None, timestamp: float) -> GestureEvent:
         if landmarks is None:
+            self._pinch_active = False
             return GestureEvent()
         points = np.asarray(landmarks, dtype=np.float64)
         palm = is_open_palm(points)
-        pinch = is_pinch(points)
+        ratio = pinch_ratio(points)
+        if self._pinch_active:
+            self._pinch_active = ratio < self.pinch_off
+        else:
+            self._pinch_active = ratio < self.pinch_on
+        pinch = self._pinch_active
         raised = bool(palm and float(points[WRIST, 1]) < self.raised_y)
         wrist_x = float(points[WRIST, 0])
         self._history.append((timestamp, wrist_x))

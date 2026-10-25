@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from src.config_loader import Theme
+from src.config_loader import AvatarConfig, SidebarConfig, Theme
 
 REFERENCE_WIDTH = 1280
 REFERENCE_HEIGHT = 720
@@ -77,6 +77,51 @@ def widget_names_for_cue(cue: dict | None) -> list[str]:
     elif cue_type == "ENCOURAGE":
         names.append("pace")
     return names
+
+
+def sidebar_bounds(width: int, height: int, sidebar: SidebarConfig) -> WidgetBox:
+    """Pixel box for the feedback column. It always touches the chosen edge."""
+    if width <= 1 or height <= 0:
+        return WidgetBox("sidebar", 0, 0, max(width, 0), max(height, 0))
+    ratio = min(0.9, max(0.05, float(sidebar.width_ratio)))
+    panel_w = max(1, int(round(width * ratio)))
+    panel_w = min(panel_w, width - 1)
+    x = 0 if sidebar.side == "left" else width - panel_w
+    return WidgetBox("sidebar", x, 0, panel_w, height)
+
+
+def avatar_bounds(panel: WidgetBox, avatar: AvatarConfig) -> WidgetBox:
+    """Top of the sidebar. The team draws the avatar inside this rectangle."""
+    ratio = min(1.0, max(0.05, float(avatar.height_ratio)))
+    height = max(1, int(round(panel.h * ratio)))
+    height = min(height, max(1, panel.h))
+    return WidgetBox("avatar", panel.x, panel.y, panel.w, height)
+
+
+def layout_hud(
+    width: int,
+    height: int,
+    names: list[str],
+    sidebar: SidebarConfig,
+    avatar: AvatarConfig,
+) -> tuple[list[WidgetBox], WidgetBox, WidgetBox]:
+    """Place coaching widgets in the area the sidebar does not cover.
+
+    Returns ``(widgets, sidebar_panel, avatar_slot)``. Widget coordinates are
+    already shifted when the sidebar sits on the left.
+    """
+    panel = sidebar_bounds(width, height, sidebar)
+    if sidebar.side == "left":
+        origin_x = panel.w
+        content_w = max(1, width - panel.w)
+    else:
+        origin_x = 0
+        content_w = max(1, width - panel.w)
+    shifted = [
+        WidgetBox(box.name, box.x + origin_x, box.y, box.w, box.h)
+        for box in layout_widgets(content_w, height, names)
+    ]
+    return shifted, panel, avatar_bounds(panel, avatar)
 
 
 def layout_widgets(width: int, height: int, names: list[str]) -> list[WidgetBox]:
@@ -257,6 +302,62 @@ def _draw_reticle(
     cv2.line(
         image, (cx + radius - tick, cy), (cx + radius + tick, cy), color, 1, cv2.LINE_AA
     )
+
+
+LEVEL_DB_MIN = 20.0
+LEVEL_DB_MAX = 80.0
+
+
+def mic_meter_box(width: int, height: int, sidebar: SidebarConfig) -> WidgetBox:
+    """Always-on level bar in the area the sidebar does not cover."""
+    panel = sidebar_bounds(width, height, sidebar)
+    margin = 8 if min(width, height) >= 80 else 4
+    bar_h = 10 if height >= 80 else 6
+    available = max(24, width - panel.w - 2 * margin)
+    bar_w = min(160, available)
+    if sidebar.side == "left":
+        x = min(max(0, width - bar_w - margin), panel.w + margin)
+    else:
+        x = margin
+    y = max(0, height - bar_h - margin)
+    return WidgetBox("mic", int(x), int(y), int(bar_w), int(bar_h))
+
+
+def _db_fraction(decibels: float) -> float:
+    span = LEVEL_DB_MAX - LEVEL_DB_MIN
+    return max(0.0, min(1.0, (float(decibels) - LEVEL_DB_MIN) / span))
+
+
+def draw_mic_meter(
+    image: np.ndarray,
+    box: WidgetBox,
+    volume_db: float,
+    threshold_db: float,
+    theme: Theme,
+) -> None:
+    """Horizontal dB bar with a marker on the speak-up line."""
+    if box.w < 8 or box.h < 4:
+        return
+    frame_h, frame_w = image.shape[:2]
+    x0 = max(0, min(frame_w - 1, box.x))
+    y0 = max(0, min(frame_h - 1, box.y))
+    x1 = max(x0 + 1, min(frame_w, box.x + box.w))
+    y1 = max(y0 + 1, min(frame_h, box.y + box.h))
+    neutral = hex_to_bgr(theme.colors.get("neutral", "#334455"))
+    fill = hex_to_bgr(
+        theme.colors.get(
+            "warning" if volume_db < threshold_db else "primary", "#FFFFFF"
+        )
+    )
+    marker = hex_to_bgr(theme.colors.get("alert", "#FF003C"))
+    cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), neutral, 1, cv2.LINE_AA)
+    inner_w = max(1, x1 - x0 - 2)
+    filled = int(round(inner_w * _db_fraction(volume_db)))
+    if filled > 0 and y1 - y0 > 2:
+        cv2.rectangle(image, (x0 + 1, y0 + 1), (x0 + filled, y1 - 2), fill, -1)
+    mark = x0 + 1 + int(round(inner_w * _db_fraction(threshold_db)))
+    mark = max(x0 + 1, min(x1 - 2, mark))
+    cv2.line(image, (mark, y0), (mark, y1 - 1), marker, 1)
 
 
 def _draw_level(

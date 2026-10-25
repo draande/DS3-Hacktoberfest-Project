@@ -32,11 +32,21 @@ class CueFilter:
         self.global_gap_seconds = global_gap_seconds
         self._last_by_type: dict[str, float] = {}
         self._last_any = -1.0e9
+        self._last_fired_type: str | None = None
         self.snooze_until = -1.0e9
         self.active: ActiveCue | None = None
         self.fired_at: float | None = None
 
     def consider(self, cue: dict | None, now: float) -> dict | None:
+        return self.consider_many([] if not cue else [cue], now)
+
+    def consider_many(self, cues: list[dict] | None, now: float) -> dict | None:
+        """Show one eligible cue, and let a type that just fired yield.
+
+        Several conditions can be true at once. The type that was just on
+        screen waits its cooldown and, when another type is also ready, steps
+        aside so posture cannot occupy every slot.
+        """
         self.fired_at = None
         if self.active is not None and self.active.expired(now):
             self.active = None
@@ -45,21 +55,37 @@ class CueFilter:
             return None
         if self.active is not None:
             return self.active.payload
-        if not cue or str(cue.get("priority", "")).upper() == "NONE":
-            return None
-        if str(cue.get("cue_type", "")).upper() == "NONE":
-            return None
-        cue_type = str(cue["cue_type"])
-        last_same = self._last_by_type.get(cue_type, -1.0e9)
-        if now - last_same < self.cooldown_seconds:
+        eligible: list[dict] = []
+        for cue in cues or []:
+            if not cue or str(cue.get("priority", "")).upper() == "NONE":
+                continue
+            cue_type = str(cue.get("cue_type", "")).upper()
+            if not cue_type or cue_type == "NONE":
+                continue
+            last_same = self._last_by_type.get(cue_type, -1.0e9)
+            if now - last_same < self.cooldown_seconds:
+                continue
+            eligible.append(cue)
+        if not eligible:
             return None
         if now - self._last_any < self.global_gap_seconds:
             return None
+        chosen = eligible[0]
+        if self._last_fired_type is not None and len(eligible) > 1:
+            others = [
+                cue
+                for cue in eligible
+                if str(cue.get("cue_type", "")).upper() != self._last_fired_type
+            ]
+            if others:
+                chosen = others[0]
+        cue_type = str(chosen["cue_type"]).upper()
         self._last_by_type[cue_type] = now
         self._last_any = now
-        self.active = ActiveCue(payload=cue, started_at=now)
+        self._last_fired_type = cue_type
+        self.active = ActiveCue(payload=chosen, started_at=now)
         self.fired_at = now
-        return cue
+        return chosen
 
     def dismiss(self, now: float) -> None:
         self.active = None

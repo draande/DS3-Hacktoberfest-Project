@@ -61,7 +61,9 @@ class SessionControl:
         self.filter = CueFilter(cooldown_seconds, snooze_seconds, global_gap_seconds)
         self.taps = TapDetector()
         self._palm_held = False
-        self._pinch_held = False
+        self._pinch_since: float | None = None
+        self._pinch_latched = False
+        self.pinch_hold_seconds = 0.4
 
     @property
     def theme_name(self) -> str:
@@ -121,10 +123,21 @@ class SessionControl:
             self._palm_held = True
         else:
             self._palm_held = False
-        if event.pinch and not self._pinch_held and action is None:
-            self.adjust_threshold_scale(0.1)
-            action = "sensitivity"
-        self._pinch_held = event.pinch
+        if event.pinch:
+            if self._pinch_since is None:
+                self._pinch_since = now
+            held = now - self._pinch_since
+            if (
+                held + 1e-3 >= self.pinch_hold_seconds
+                and not self._pinch_latched
+                and action is None
+            ):
+                self.adjust_threshold_scale(0.1)
+                action = "sensitivity"
+                self._pinch_latched = True
+        else:
+            self._pinch_since = None
+            self._pinch_latched = False
         return action
 
     def handle_audio(self, samples, now: float) -> str | None:

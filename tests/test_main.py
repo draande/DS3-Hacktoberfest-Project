@@ -1,8 +1,10 @@
+import time
+
 import numpy as np
 
 from main import main
-from src.main import format_summary, run_session
-from src.main import parse_args
+from src.intelligence.gemma_client import GemmaClient
+from src.main import RunSummary, format_summary, parse_args, run_session
 
 
 def test_main_banner_and_short_headless_demo(capsys):
@@ -24,6 +26,41 @@ def test_main_banner_and_short_headless_demo(capsys):
     assert "Hello from Wingman!" in captured.out
     assert "Wingman demo" in captured.out
     assert "coaching=offline" in captured.out
+
+
+def test_summary_reports_gemma_success_and_failure_counts():
+    text = format_summary(RunSummary(fallback=False, gemma_ok=2, gemma_failed=1))
+    assert "coaching=gemma" in text
+    assert "gemma_ok=2" in text
+    assert "gemma_failed=1" in text
+
+
+def test_demo_loop_does_not_wait_for_a_slow_gemma_call():
+    def slow(_prompt: str) -> str:
+        time.sleep(1.5)
+        return (
+            '{"priority":"LOW","cue_type":"ENCOURAGE","display_text":"Great pace",'
+            '"icon":"ok","duration_ms":2000,"audio_chime":false}'
+        )
+
+    client = GemmaClient(
+        api_key="test-key",
+        transport=slow,
+        min_interval=2.5,
+        timeout=5,
+        report_timeout=0,
+    )
+    started = time.perf_counter()
+    summary = run_session(
+        parse_args(["--frames", "6", "--fps", "10", "--width", "80", "--height", "48"]),
+        client=client,
+    )
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0
+    assert summary.frames == 6
+    assert summary.fallback is True
+    assert "POSTURE" in summary.cue_types
+    assert "ENCOURAGE" not in summary.cue_types
 
 
 def test_parse_args_defaults_to_demo_and_live_camera_opts_out():

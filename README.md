@@ -22,6 +22,8 @@ Useful flags:
 
 ```bash
 uv run python main.py --demo --duration 18 --fps 10 --width 640 --height 360
+uv run python main.py --camera 0 --display             # live cues, meter, Gemma insights
+uv run python main.py --demo --display                 # borderless fullscreen preview
 uv run python main.py --demo --timer 20 --display          # preview the edge vignette
 uv run python main.py --demo --theme minimalist
 uv run python main.py --offline                            # ignore a Gemma API key
@@ -40,9 +42,21 @@ uv run python main.py --camera 0 --display
 
 `--video clip.mp4` plays a file instead of the webcam. Vision cues appear only after the models load. Audio cues need a working microphone; if PortAudio is missing, the HUD still runs and prints the reason.
 
+The microphone is opened at the device's own sample rate (often 44.1 or 48 kHz) and resampled to 16 kHz for the volume and pace math. A fixed 16 kHz mono capture is accepted by many devices and then never delivers samples. The input stream is also restarted once after open, because PortAudio can report it active while the callback never runs. Cue chimes play on a speaker stream at that device's rate. `--display` and live mode play those chimes. `--display` and `--chimes` also play the demo's scripted audio in real time. On Windows, if the mic stays closed, allow desktop apps under Settings → Privacy → Microphone. The pygame preview uses a dummy audio driver so it does not take the sound card away from PortAudio.
+
+A level meter sits at the bottom of the HUD with a mark on the 42 dB speak-up line, so you can see the microphone working even when no volume cue is up. Live posture spends the first `posture.calibrate_seconds` (3s) learning how you sit in front of the laptop camera, then cues only when you slouch further than that baseline. A pinch has to be held for about 0.4s, with hysteresis on the finger gap, before it changes sensitivity.
+
+Posture, volume, pace, and gaze are decided on the device every frame. If several are true, the one that just appeared yields so another type can take the next slot. Gemma does not replace those cues.
+
 ## Gemma
 
-If `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` is set, Wingman asks Google Gemma (`gemma-3-12b-it` by default, override with `GEMMA_MODEL`) for the cue JSON. With no key, or when the response is not valid JSON, a deterministic offline coach emits the same schema. The test suite clears those variables so it never calls the network.
+Gemma writes two slow things: a trend every `gemma.min_interval_seconds` (18s) and a short report when the session ends. The default model is `gemma-4-26b-a4b-it`. `GEMMA_MODEL` overrides `gemma.model`. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable it. With no key, the same slots are filled locally and nothing is sent over the network.
+
+Each insight call sends a compact summary of the last 45 seconds (cue counts, average dB, WPM, gaze-away, posture), not the raw frame history. Output room is `gemma.max_output_tokens` (2048) so the model's thinking tokens do not come back as an empty reply. The client timeout defaults to 45 seconds and cannot be configured below 10, which the API rejects. A 429 or 504 backs off exponentially. Every call logs its latency, and the end summary includes `gemma_avg`.
+
+The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `GEMMA` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
+
+When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on either call. The test suite clears the key and model variables and uses fake transports.
 
 ## Hotkeys
 
@@ -50,11 +64,13 @@ Shown while a preview window is open (`--display`):
 
 | Key | Action |
 | --- | --- |
+| F | Toggle borderless fullscreen |
+| Esc | Leave fullscreen. When the window is already windowed, quit |
+| Q | Quit the preview |
 | Space, Enter, T | Dismiss the active cue (earbud double-tap) |
 | S | Snooze every cue for 30 seconds |
 | M | Switch between Ironman and Minimalist |
 | `[` / `]` | More sensitive / less sensitive coaching thresholds |
-| Q or Esc | Quit the preview |
 
 Gestures, from hand landmarks:
 
@@ -66,9 +82,25 @@ Gestures, from hand landmarks:
 
 Two loud spikes about 50–450 ms apart also dismiss the active cue.
 
+`--display` opens a borderless fullscreen window at the screen resolution and lays the HUD out at that size, so the picture is not a small canvas stretched to fit. On Windows the process is marked DPI-aware before the screen size is read. If the screen size cannot be detected, the window still requests fullscreen at the configured `hud.width` and `hud.height`. Headless mode never opens a window. Esc leaves fullscreen; press Esc again, or Q, to quit.
+
+## Feedback sidebar
+
+Gemma's JSON includes a `bullets` array: 1 to 4 lines, each 3 to 6 words, most urgent first. Those lines appear in a sidebar, on the right by default. Newest lines sit on top. Each line fades out and then expires (`hud.sidebar.ttl_seconds` and `fade_seconds`). Set `hud.sidebar.side` to `left` to flip the column. Offline mode, and any reply that omits `bullets`, fills the sidebar from the cue text so the demo still shows feedback. Ironman draws a dark bracketed panel. Minimalist draws a thin frosted panel without brackets.
+
+## Avatar slot
+
+The avatar itself is not part of this build. The top of the sidebar is reserved for it (`hud.avatar.anchor: sidebar_top`, `hud.avatar.height_ratio`). `src/hud/avatar.py` paints a labeled placeholder and documents the hook:
+
+```python
+draw_avatar(frame, rect, state)  # rect is (x, y, width, height)
+```
+
+`state` is an `AvatarState` with the theme name, the active cue, whether the speaker is talking, volume, pace, and time remaining. Replace `draw_avatar`, or assign your own `AvatarWidget` to `HudRenderer.avatar_widget`. The renderer calls `widget.draw(frame, rect, state)` with the same contract.
+
 ## Configuration
 
-`config/default_config.yaml` holds the plan thresholds (12° slouch, 15% forward head, 4 s gaze, 42 dB speak-up, 180 WPM rush, 5 s cue cooldown, vignette at 25% and 10%). `config/themes.yaml` holds the Ironman and Minimalist palettes.
+`config/default_config.yaml` holds the plan thresholds (12° slouch, 15% forward head, 4 s gaze, 42 dB speak-up, 180 WPM rush, 5 s cue cooldown, vignette at 25% and 10%) plus the sidebar and avatar slot. `config/themes.yaml` holds the Ironman and Minimalist palettes.
 
 Digital audio has no sound-pressure level. Volume uses `dB = 20 log10(RMS / 1e-4)`, so a full-scale tone is about 80 dB and the 42 dB cue lines up with a quiet talker.
 

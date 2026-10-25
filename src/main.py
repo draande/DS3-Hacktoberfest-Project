@@ -3,25 +3,34 @@
 from __future__ import annotations
 
 import argparse
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from src.audio.audio_feedback import chime_for_cue, play_chime
+from src.audio.audio_feedback import AudioOutput, chime_for_cue
 from src.audio.pace_analyzer import PaceAnalyzer
 from src.audio.volume_analyzer import VolumeAnalyzer
 from src.capture.audio_stream import AudioCaptureError, MicrophoneStream
 from src.capture.video_stream import CameraUnavailable, FileVideoSource, WebcamSource
-from src.config_loader import AppConfig, load_config
+from src.config_loader import REPO_ROOT, AppConfig, load_config
 from src.controls.session_control import SessionControl
 from src.demo_scene import DemoScene
+from src.hud.display import detect_screen_size, prepare_display_frame
 from src.hud.renderer import HudRenderer, HudState, PreviewWindow
-from src.intelligence.gemma_client import CoachMetrics, GemmaClient
+from src.intelligence.gemma_client import (
+    CoachMetrics,
+    GemmaClient,
+    active_cues,
+    offline_insights,
+    render_report_markdown,
+)
+from src.intelligence.session_stats import SessionStats, save_report
 from src.vision.audience_tells import analyze_audience, tells_from_blendshapes
 from src.vision.gaze_tracker import GazeTracker
 from src.vision.gesture_detector import GestureDetector
 from src.vision.mediapipe_backend import MediaPipeBackend, download_models
-from src.vision.pose_tracker import analyze_posture
+from src.vision.pose_tracker import PostureCalibrator, analyze_posture
 
 
 @dataclass
@@ -48,6 +57,10 @@ class RunSummary:
     demo: bool = True
     theme: str = "ironman"
     fallback: bool = True
+    gemma_ok: int = 0
+    gemma_failed: int = 0
+    gemma_avg: float | None = None
+    report: str = ""
     frames: int = 0
     duration: float = 0.0
     cues: list[tuple[float, str, str]] = field(default_factory=list)
@@ -107,7 +120,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument(
         "--chimes",
         action="store_true",
-        help="Play synthesized cue chimes when PortAudio is available",
+        help="Play cue chimes and, in the demo, the scripted audio. Live mode and --display do this too.",
     )
     parser.add_argument(
         "--offline",
@@ -145,8 +158,13 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
 def format_summary(summary: RunSummary) -> str:
     mode = "demo" if summary.demo else "live"
     coaching = "offline" if summary.fallback else "gemma"
+    latency = (
+        "" if summary.gemma_avg is None else f" gemma_avg={summary.gemma_avg:.1f}s"
+    )
     lines = [
-        f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | frames={summary.frames}"
+        f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | "
+        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed}{latency} | "
+        f"frames={summary.frames}"
     ]
     events = [
         (timestamp, f"t={timestamp:05.2f} {cue_type} {text}")
@@ -164,7 +182,11 @@ def format_summary(summary: RunSummary) -> str:
     return "\n".join(lines)
 
 
-def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSummary:
+def run_session(
+    options: RunOptions,
+    config: AppConfig | None = None,
+    client: GemmaClient | None = None,
+) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
         paths = download_models()
@@ -204,6 +226,8 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
         app_config.theme(control.theme_name),
         warning_ratio=app_config.timer.warning_ratio,
         critical_ratio=app_config.timer.critical_ratio,
+        sidebar_config=app_config.hud.sidebar,
+        avatar_config=app_config.hud.avatar,
     )
     volume = VolumeAnalyzer(
         threshold_db=app_config.volume.speak_up_db,
@@ -232,22 +256,43 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
         history_seconds=app_config.gaze.history_seconds,
     )
     gestures = GestureDetector()
-    client = GemmaClient.from_env(
-        model=app_config.gemma.model,
-        duration_ms=app_config.cues.duration_ms,
-        offline=options.offline,
-    )
+    stats = SessionStats(window_seconds=45.0)
+    if client is None:
+        client = GemmaClient.from_env(
+            model=app_config.gemma.model,
+            duration_ms=app_config.cues.duration_ms,
+            offline=options.offline,
+            min_interval=app_config.gemma.min_interval_seconds,
+            timeout=app_config.gemma.timeout_seconds,
+            report_timeout=app_config.gemma.report_timeout_seconds,
+            max_output_tokens=app_config.gemma.max_output_tokens,
+        )
     summary = RunSummary(
         demo=options.demo, theme=control.theme_name, fallback=client.used_fallback
     )
+    playback = _start_playback(options, app_config.audio.sample_rate, summary)
 
     scene = (
         DemoScene(width, height, app_config.audio.sample_rate) if options.demo else None
     )
+    calibrator = None
+    if scene is None:
+        calibrator = PostureCalibrator(
+            warmup_seconds=app_config.posture.calibrate_seconds,
+            slouch_margin=app_config.posture.slouch_margin_degrees,
+            forward_margin=app_config.posture.forward_margin,
+        )
     video = None
     microphone = None
     backend = None
-    preview = PreviewWindow(options.display_backend) if options.display else None
+    preview = None
+    if options.display:
+        preview = PreviewWindow(
+            options.display_backend,
+            screen_size=detect_screen_size(),
+            windowed_size=(width, height),
+            fullscreen=True,
+        )
     if scene is None:
         try:
             if options.video:
@@ -258,6 +303,9 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 )
         except (CameraUnavailable, FileNotFoundError, RuntimeError) as exc:
             summary.error = str(exc)
+            client.close()
+            if playback is not None:
+                playback.close()
             return summary
         microphone = MicrophoneStream(
             sample_rate=app_config.audio.sample_rate,
@@ -269,6 +317,11 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
         except AudioCaptureError as exc:
             summary.notes.append(str(exc))
             microphone = None
+        else:
+            if microphone.capture_rate != microphone.sample_rate:
+                summary.notes.append(
+                    f"microphone {microphone.capture_rate} Hz resampled to {microphone.sample_rate} Hz"
+                )
         backend = MediaPipeBackend()
         if not backend.load():
             summary.notes.append(backend.error or "MediaPipe models are not loaded")
@@ -276,12 +329,19 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
     sample_rate = app_config.audio.sample_rate
     audio_cursor = 0
     frame_index = 0
+    pace_clock = time.perf_counter()
     try:
         while frame_limit is None or frame_index < frame_limit:
             timestamp = frame_index / fps
+            if preview is not None:
+                target_w, target_h = preview.target_size()
+            else:
+                target_w, target_h = width, height
             hand = None
             blendshapes = None
             if scene is not None:
+                scene.width = target_w
+                scene.height = target_h
                 chunk_count = max(1, int(round(sample_rate / fps)))
                 sample = scene.sample(timestamp, audio_cursor, chunk_count)
                 audio_cursor += chunk_count
@@ -290,6 +350,8 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 face_landmarks = sample.face
                 hand = sample.hand
                 audio = sample.audio
+                if playback is not None and playback.active:
+                    playback.write(audio)
             else:
                 assert video is not None
                 video_frame = video.read()
@@ -309,6 +371,11 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                     audio = microphone.pop_ready().samples
                 else:
                     audio = np.zeros(max(1, int(sample_rate / fps)), dtype=np.float32)
+                if preview is not None and (frame.shape[1], frame.shape[0]) != (
+                    target_w,
+                    target_h,
+                ):
+                    frame = prepare_display_frame(frame, target_w, target_h)
 
             posture = (
                 analyze_posture(
@@ -319,6 +386,8 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 if pose_landmarks is not None
                 else None
             )
+            if posture is not None and calibrator is not None:
+                posture = calibrator.observe(posture, timestamp)
             gaze_state = gaze.update(face_landmarks, timestamp)
             if blendshapes:
                 audience = tells_from_blendshapes(blendshapes)
@@ -366,17 +435,35 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                 audience_surprised=False if audience is None else audience.surprised,
                 blendshapes={} if audience is None else dict(audience.blendshapes),
             )
-            proposal = client.arbitrate(metrics)
-            active = control.filter.consider(proposal, timestamp)
+            stats.observe(
+                timestamp,
+                volume_reading.db,
+                pace_reading.wpm,
+                bool(gaze_state.cue),
+                bool(metrics.posture_alert),
+            )
+            client.poll(stats.recent(timestamp), timestamp)
+            active = control.filter.consider_many(
+                active_cues(metrics, app_config.cues.duration_ms), timestamp
+            )
             if control.filter.fired_at == timestamp and active is not None:
                 summary.cues.append(
                     (timestamp, active["cue_type"], active["display_text"])
                 )
+                renderer.sidebar.push(
+                    active.get("bullets") or [active["display_text"]], timestamp
+                )
+                stats.note_cue(timestamp, active["cue_type"])
                 if active.get("audio_chime"):
-                    chime = chime_for_cue(active["cue_type"], sample_rate)
                     summary.chimes += 1
-                    if options.chimes:
-                        play_chime(chime, sample_rate)
+                    if playback is not None and playback.active:
+                        playback.play(chime_for_cue(active["cue_type"], sample_rate))
+
+            if client.bullets and client.status in {"gemma", "thinking"}:
+                insight_lines = client.bullets
+            else:
+                insight_lines = offline_insights(stats.recent(timestamp))
+            renderer.sidebar.push_insights(insight_lines, timestamp)
 
             remaining = max(0.0, timer_seconds - timestamp)
             ratio = remaining / timer_seconds if timer_seconds else 0.0
@@ -389,6 +476,8 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                     volume_db=volume_reading.db,
                     wpm=pace_reading.wpm,
                     pulse_t=timestamp,
+                    coaching_status=client.status,
+                    level_threshold_db=control.effective_speak_up_db(),
                 ),
             )
             if summary.first_frame is None:
@@ -397,12 +486,16 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
             summary.frames = frame_index + 1
             summary.duration = timestamp
             summary.fallback = client.used_fallback
+            summary.gemma_ok = client.succeeded
+            summary.gemma_failed = client.failed
             summary.theme = control.theme_name
 
             if preview is not None:
                 key = preview.show(rendered)
                 if key == "quit":
                     break
+                if key in {"fullscreen", "exit_fullscreen"}:
+                    key = None
                 if key:
                     action = control.handle_key(key, timestamp)
                     if action == "quit":
@@ -411,6 +504,15 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
                         summary.actions.append((timestamp, action))
                     if control.theme_name != renderer.theme.key:
                         renderer.set_theme(app_config.theme(control.theme_name))
+            if scene is not None and (
+                preview is not None or (playback is not None and playback.active)
+            ):
+                pace_clock += 1.0 / fps
+                delay = pace_clock - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    pace_clock = time.perf_counter()
             frame_index += 1
     finally:
         if video is not None:
@@ -421,7 +523,41 @@ def run_session(options: RunOptions, config: AppConfig | None = None) -> RunSumm
             backend.close()
         if preview is not None:
             preview.close()
+        if playback is not None:
+            playback.close()
+        window = stats.overall(summary.duration)
+        source, strengths, improve = client.report(window)
+        summary.report = render_report_markdown(window, strengths, improve, source)
+        try:
+            path = save_report(summary.report, REPO_ROOT / "reports")
+            summary.notes.append(f"report {path}")
+        except OSError as exc:
+            summary.notes.append(f"report was not saved ({exc})")
+        summary.gemma_ok = client.succeeded
+        summary.gemma_failed = client.failed
+        summary.gemma_avg = client.average_latency
+        summary.fallback = client.succeeded == 0
+        client.close()
     return summary
+
+
+def _start_playback(
+    options: RunOptions, sample_rate: int, summary: RunSummary
+) -> AudioOutput | None:
+    """Speakers are used for live coaching, --display, and --chimes.
+
+    Headless demo runs stay silent so tests do not open a device.
+    """
+    if not (options.chimes or options.display or not options.demo):
+        return None
+    playback = AudioOutput(sample_rate)
+    if not playback.start():
+        summary.notes.append(playback.error or "Audio output is unavailable.")
+    elif playback.output_rate != sample_rate:
+        summary.notes.append(
+            f"speakers {playback.output_rate} Hz, cues mixed from {sample_rate} Hz"
+        )
+    return playback
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -432,4 +568,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if summary.error is None else 1
     summary = run_session(options)
     print(format_summary(summary))
+    if summary.report:
+        print()
+        print(summary.report)
     return 0 if summary.error is None else 1

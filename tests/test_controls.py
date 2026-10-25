@@ -52,8 +52,12 @@ def test_raised_palm_snoozes_and_swipe_cycles_themes():
     assert later.handle_gesture(swipe, 0.0) == "theme"
     assert later.theme_name == "minimalist"
     pinch = GestureEvent(name="pinch", pinch=True)
-    assert later.handle_gesture(pinch, 0.2) == "sensitivity"
+    assert later.handle_gesture(pinch, 0.0) is None
+    assert later.handle_gesture(pinch, 0.2) is None
+    assert later.handle_gesture(GestureEvent(), 0.25) is None
     assert later.handle_gesture(pinch, 0.3) is None
+    assert later.handle_gesture(pinch, 0.75) == "sensitivity"
+    assert later.handle_gesture(pinch, 0.9) is None
     assert later.threshold_scale == pytest_approx(1.1)
 
 
