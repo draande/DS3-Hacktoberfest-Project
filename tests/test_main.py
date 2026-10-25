@@ -76,6 +76,13 @@ def test_demo_emits_the_coaching_sequence_and_a_palm_snooze():
     assert "Look right" in text
 
 
+def test_demo_palm_is_a_short_snooze_then_the_talk_continues():
+    from src.demo_scene import section_at
+
+    assert section_at(17.2)[-1] == "palm"
+    assert section_at(20.0)[-1] is None
+
+
 def test_demo_frame_is_finite():
     summary = run_session(
         parse_args(

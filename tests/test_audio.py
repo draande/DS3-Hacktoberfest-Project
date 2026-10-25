@@ -98,6 +98,15 @@ def test_a_real_pause_resets_the_run_on_clock():
     assert paused.run_on is False
 
 
+def test_phrase_pauses_keep_comfortable_speech_from_running_on():
+    sample_rate = 16000
+    analyzer = PaceAnalyzer(sample_rate=sample_rate, continuous_speech_seconds=8.0)
+    reading = analyzer.update(
+        audio_chunk("speech", 0, 9 * sample_rate, sample_rate), 9.0
+    )
+    assert reading.run_on is False
+
+
 def test_chime_is_a_bounded_tone_at_the_requested_frequency():
     sample_rate = 16000
     wave = synthesize_chime(880, duration=0.18, sample_rate=sample_rate, volume=0.2)

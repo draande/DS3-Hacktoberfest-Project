@@ -13,7 +13,8 @@ _SECTIONS = (
     (4.0, 8.0, "upright", "center", "neutral", "quiet", None),
     (8.0, 12.0, "upright", "center", "neutral", "rush", None),
     (12.0, 17.0, "upright", "left", "neutral", "speech", None),
-    (17.0, 1.0e9, "upright", "center", "neutral", "speech", "palm"),
+    (17.0, 18.0, "upright", "center", "neutral", "speech", "palm"),
+    (18.0, 1.0e9, "upright", "center", "neutral", "speech", None),
 )
 
 
@@ -163,7 +164,11 @@ def audio_chunk(kind: str, start: int, count: int, sample_rate: int) -> np.ndarr
         return tone(start, count, sample_rate, 180.0, 0.003)
     if kind == "rush":
         return pulsed_speech(start, count, sample_rate, 6.5, 0.22)
-    return pulsed_speech(start, count, sample_rate, 3.5, 0.2)
+    signal = pulsed_speech(start, count, sample_rate, 3.5, 0.2)
+    # A real sentence leaves a gap. Without it, syllabic speech looks like an 8 s run-on.
+    times = (start + np.arange(count, dtype=np.float32)) / float(sample_rate)
+    signal[np.mod(times, 4.0) >= 3.55] = 0
+    return signal
 
 
 def background_frame(timestamp: float, width: int, height: int) -> np.ndarray:

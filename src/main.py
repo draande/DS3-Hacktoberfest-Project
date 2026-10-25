@@ -148,13 +148,15 @@ def format_summary(summary: RunSummary) -> str:
     lines = [
         f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | frames={summary.frames}"
     ]
-    lines.extend(
-        f"t={timestamp:05.2f} {cue_type} {text}"
+    events = [
+        (timestamp, f"t={timestamp:05.2f} {cue_type} {text}")
         for timestamp, cue_type, text in summary.cues
+    ]
+    events.extend(
+        (timestamp, f"t={timestamp:05.2f} action {action}")
+        for timestamp, action in summary.actions
     )
-    lines.extend(
-        f"t={timestamp:05.2f} action {action}" for timestamp, action in summary.actions
-    )
+    lines.extend(line for _, line in sorted(events, key=lambda item: item[0]))
     lines.extend(summary.notes)
     if summary.error:
         lines.append(summary.error)
