@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -10,14 +11,21 @@ import numpy as np
 
 from src.audio.audio_feedback import AudioOutput, chime_for_cue
 from src.audio.pace_analyzer import PaceAnalyzer
+from src.audio.speech_transcriber import (
+    SpeechTranscriber,
+    load_transcriber,
+    prepare_spoken_ask,
+)
 from src.audio.volume_analyzer import VolumeAnalyzer
 from src.capture.audio_stream import AudioCaptureError, MicrophoneStream
 from src.capture.video_stream import CameraUnavailable, FileVideoSource, WebcamSource
 from src.config_loader import REPO_ROOT, AppConfig, load_config
 from src.controls.session_control import SessionControl
 from src.demo_scene import DemoScene
+from src.hud.ask_input import AskComposer, SpeechRecorder, dispatch_preview_key
 from src.hud.display import detect_screen_size, prepare_display_frame
 from src.hud.renderer import HudRenderer, HudState, PreviewWindow
+from src.intelligence.ask_gemma import AskGemma, AskState
 from src.intelligence.gemma_client import (
     CoachMetrics,
     GemmaClient,
@@ -51,6 +59,7 @@ class RunOptions:
     chimes: bool = False
     offline: bool = False
     download_models: bool = False
+    ask: str | None = None
 
 
 @dataclass
@@ -136,6 +145,13 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         action="store_true",
         help="Download MediaPipe .task models into models/ and exit",
     )
+    parser.add_argument(
+        "--ask",
+        nargs="?",
+        const="-",
+        default=None,
+        help="Ask Gemma one question and exit. Omit the text, or pass -, to read stdin.",
+    )
     args = parser.parse_args(argv)
     demo = bool(args.demo or (args.camera is None and args.video is None))
     if args.camera is not None or args.video is not None:
@@ -156,6 +172,7 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         chimes=args.chimes,
         offline=args.offline,
         download_models=args.download_models,
+        ask=args.ask,
     )
 
 
@@ -198,6 +215,7 @@ def run_session(
     client: InsightClient | None = None,
     insight_client: InsightClient | None = None,
     gemma_client: GemmaClient | None = None,
+    transcriber: SpeechTranscriber | None = None,
 ) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
@@ -295,6 +313,10 @@ def run_session(
         theme=control.theme_name,
         fallback=insight_client.used_fallback,
     )
+    asker = AskGemma(gemma_client)
+    composer = AskComposer()
+    recorder = SpeechRecorder()
+    transcriber_box: dict[str, SpeechTranscriber | None] = {"value": transcriber}
     playback = _start_playback(options, app_config.audio.sample_rate, summary)
 
     scene = (
@@ -328,6 +350,7 @@ def run_session(
                 )
         except (CameraUnavailable, FileNotFoundError, RuntimeError) as exc:
             summary.error = str(exc)
+            asker.close()
             insight_client.close()
             gemma_client.close()
             if playback is not None:
@@ -469,6 +492,15 @@ def run_session(
                 bool(metrics.posture_alert),
             )
             insight_client.poll(stats.recent(timestamp), timestamp)
+            if recorder.add(audio, sample_rate):
+                _send_spoken_ask(
+                    asker,
+                    gemma_client.model,
+                    recorder.take(),
+                    stats.recent(timestamp),
+                    timestamp,
+                    _transcriber(transcriber_box),
+                )
             active = control.filter.consider_many(
                 active_cues(metrics, app_config.cues.duration_ms), timestamp
             )
@@ -493,6 +525,14 @@ def run_session(
             else:
                 insight_lines = offline_insights(stats.recent(timestamp))
             renderer.sidebar.push_insights(insight_lines, timestamp)
+            ask_state = asker.snapshot()
+            renderer.sidebar.show_ask(
+                ask_state.question,
+                ask_state.phase,
+                ask_state.lines,
+                ask_state.started_at,
+                timestamp,
+            )
 
             remaining = max(0.0, timer_seconds - timestamp)
             ratio = remaining / timer_seconds if timer_seconds else 0.0
@@ -507,6 +547,8 @@ def run_session(
                     pulse_t=timestamp,
                     coaching_status=insight_client.status,
                     level_threshold_db=control.effective_speak_up_db(),
+                    ask_draft=None if not composer.open else composer.text,
+                    listening=recorder.active,
                 ),
             )
             if summary.first_frame is None:
@@ -520,19 +562,29 @@ def run_session(
             summary.theme = control.theme_name
 
             if preview is not None:
+                preview.text_entry = composer.open
                 key = preview.show(rendered)
-                if key == "quit":
+                dispatched = dispatch_preview_key(key, composer, control, timestamp)
+                if dispatched.quit:
                     break
-                if key in {"fullscreen", "exit_fullscreen"}:
-                    key = None
-                if key:
-                    action = control.handle_key(key, timestamp)
-                    if action == "quit":
-                        break
-                    if action:
-                        summary.actions.append((timestamp, action))
-                    if control.theme_name != renderer.theme.key:
-                        renderer.set_theme(app_config.theme(control.theme_name))
+                if dispatched.submitted:
+                    asker.submit(
+                        dispatched.submitted, stats.recent(timestamp), now=timestamp
+                    )
+                if dispatched.speech_toggle:
+                    if recorder.toggle() == "stop":
+                        _send_spoken_ask(
+                            asker,
+                            gemma_client.model,
+                            recorder.take(),
+                            stats.recent(timestamp),
+                            timestamp,
+                            _transcriber(transcriber_box),
+                        )
+                if dispatched.action:
+                    summary.actions.append((timestamp, dispatched.action))
+                if control.theme_name != renderer.theme.key:
+                    renderer.set_theme(app_config.theme(control.theme_name))
             if scene is not None and (
                 preview is not None or (playback is not None and playback.active)
             ):
@@ -555,6 +607,7 @@ def run_session(
         if playback is not None:
             playback.close()
         window = stats.overall(summary.duration)
+        asker.close()
         source, strengths, improve = gemma_client.report(window)
         summary.report = render_report_markdown(window, strengths, improve, source)
         try:
@@ -593,8 +646,76 @@ def _start_playback(
     return playback
 
 
+def _transcriber(
+    box: dict[str, SpeechTranscriber | None],
+) -> SpeechTranscriber | None:
+    if "loaded" not in box:
+        box["loaded"] = True
+        if box.get("value") is None:
+            box["value"] = load_transcriber()
+    return box.get("value")
+
+
+def _send_spoken_ask(
+    asker: AskGemma,
+    model: str,
+    clip: tuple[np.ndarray, int],
+    window,
+    now: float,
+    transcriber: SpeechTranscriber | None,
+) -> None:
+    samples, rate = clip
+    request = prepare_spoken_ask(samples, rate, model, transcriber)
+    if request.kind == "notice":
+        asker.notice(request.text, now=now)
+    elif request.kind == "audio":
+        asker.submit(request.text, window, audio=request.audio, now=now)
+    else:
+        asker.submit(request.text, window, now=now)
+
+
+def format_ask_output(question: str, state: AskState) -> str:
+    lines = [f"YOU: {question}"]
+    lines.extend(state.lines or ["Gemma could not answer."])
+    return "\n".join(lines)
+
+
+def run_cli_ask(
+    question: str, client: GemmaClient | None = None, offline: bool = False
+) -> str:
+    """One Gemma reply. Does not open a window or a camera."""
+    owns_client = client is None
+    if client is None:
+        config = load_config()
+        client = GemmaClient.from_env(
+            model=config.gemma.model,
+            duration_ms=config.cues.duration_ms,
+            offline=offline,
+            min_interval=config.gemma.min_interval_seconds,
+            timeout=config.gemma.timeout_seconds,
+            report_timeout=config.gemma.report_timeout_seconds,
+            max_output_tokens=config.gemma.max_output_tokens,
+        )
+    try:
+        state = AskGemma(client).ask_blocking(question)
+    finally:
+        if owns_client:
+            client.close()
+    return format_ask_output(question, state)
+
+
 def main(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
+    if options.ask is not None:
+        question = options.ask
+        if question == "-":
+            question = sys.stdin.readline().strip()
+        question = question.strip()
+        if not question:
+            print("Ask Gemma needs a question.")
+            return 2
+        print(run_cli_ask(question, offline=options.offline))
+        return 0
     if options.download_models:
         summary = run_session(options)
         print(format_summary(summary))

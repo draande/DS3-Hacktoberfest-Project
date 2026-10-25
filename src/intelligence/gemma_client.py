@@ -563,17 +563,19 @@ class GemmaClient:
                 return None
             return sum(self._latencies) / len(self._latencies)
 
-    def generate(self, prompt: str) -> str:
+    def generate(self, prompt: str, audio_wav: bytes | None = None) -> str:
         """Blocking Gemma completion. Do not call this on the frame-loop thread.
 
-        Ask Gemma should use this from its own worker. The Flash insight
-        client never calls it, and this does not take that client's lock.
+        Ask Gemma calls this from its own worker. The Flash insight client
+        never calls it, and this does not take that client's lock or SDK.
+        ``audio_wav`` is only for models that accept inline audio. The
+        request still has no thinking config and no JSON mime type.
         """
         if self._closed:
             raise RuntimeError("Gemma client is closed")
         if self.offline or (self.transport is None and not self.api_key):
             raise RuntimeError("Gemma is offline")
-        return self._fetch(prompt)
+        return self._fetch(prompt, audio_wav)
 
     def report(self, window: CoachWindow) -> tuple[str, list[str], list[str]]:
         """One end-of-session call. Falls back locally if Gemma does not answer.
@@ -626,11 +628,11 @@ class GemmaClient:
         with self._lock:
             self._closed = True
 
-    def _fetch(self, prompt: str) -> str:
+    def _fetch(self, prompt: str, audio_wav: bytes | None = None) -> str:
         if self.transport is not None:
             return self.transport(prompt)
         with self._call_lock:
-            return self._call_google(prompt)
+            return self._call_google(prompt, audio_wav)
 
     def _note_success(
         self,
@@ -700,12 +702,19 @@ class GemmaClient:
         )
         return self._sdk
 
-    def _call_google(self, prompt: str) -> str:
+    def _call_google(self, prompt: str, audio_wav: bytes | None = None) -> str:
         from google.genai import types
 
+        if audio_wav is None:
+            contents: str | list = prompt
+        else:
+            contents = [
+                types.Part.from_bytes(data=audio_wav, mime_type="audio/wav"),
+                types.Part.from_text(text=prompt),
+            ]
         response = self._sdk_client().models.generate_content(
             model=self.model,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(
                 max_output_tokens=self.max_output_tokens
             ),

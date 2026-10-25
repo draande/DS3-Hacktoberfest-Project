@@ -27,6 +27,7 @@ uv run python main.py --demo --display                 # borderless fullscreen p
 uv run python main.py --demo --timer 20 --display          # preview the edge vignette
 uv run python main.py --demo --theme minimalist
 uv run python main.py --offline                            # ignore a Gemma API key
+uv run python main.py --ask "how was my pace?"             # one Gemma reply, then exit
 ```
 
 `--timer 20` shortens the presentation clock so the border glow moves from clear, to amber under 25% remaining, to red under 10%. The config default is a 5 minute talk.
@@ -60,6 +61,16 @@ The sidebar shows those trend lines under an `INSIGHT` label, next to the instan
 
 When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on either call. The test suite clears the key and model variables and uses fake transports.
 
+## Ask Gemma
+
+A direct question calls `GemmaClient.generate` on Gemma's own thread. It uses `gemma.model` and `gemma.timeout_seconds`. It does not use the insight client, that client's lock, its SDK client, or its pending flag, and the request does not include a thinking config or a JSON response type. An ask cannot delay the Flash Lite loop. Only one ask is sent at a time. A second question waits until that call returns.
+
+In a preview, `G` opens a one-line bar. Enter sends it, Esc cancels it, and letters typed there do not fire other shortcuts. `F`, Esc, and `Q` behave as usual while the bar is closed. `V` toggles push-to-talk on the microphone samples the frame loop is already reading, and stops on its own after 30 seconds. `--ask "how was my pace?"` prints the question and a 1–3 line reply, then exits without a window or a camera. `--ask` on its own, or `--ask -`, reads one line from stdin.
+
+The sidebar shows `YOU`, then `THINKING...` with the elapsed seconds, then `ASK` and the reply. The reply stays up longer than a cue bullet. A timeout, 429, or 504 is one short error line. The frame loop never waits on the call.
+
+`gemma-4-26b-a4b-it` does not accept audio, so a spoken ask is transcribed first. `uv sync --group stt` installs `faster-whisper` for that. E2B, E4B, and 12B models can take the wav directly. With no transcriber and a text-only model, the sidebar says to type with `G` instead.
+
 ## Hotkeys
 
 Shown while a preview window is open (`--display`):
@@ -73,6 +84,8 @@ Shown while a preview window is open (`--display`):
 | S | Snooze every cue for 30 seconds |
 | M | Switch between Ironman and Minimalist |
 | `[` / `]` | More sensitive / less sensitive coaching thresholds |
+| G | Ask Gemma. Type a line, Enter sends, Esc cancels |
+| V | Push-to-talk. Press again to send, or wait 30 seconds |
 
 Gestures, from hand landmarks:
 
