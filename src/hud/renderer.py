@@ -14,7 +14,7 @@ import numpy as np
 from src.config_loader import AvatarConfig, SidebarConfig, Theme
 from src.hud.avatar import AvatarState, AvatarWidget
 from src.hud.display import configure_preview_window
-from src.hud.sidebar import FeedbackSidebar, draw_sidebar
+from src.hud.sidebar import FeedbackSidebar, draw_ask_bar, draw_sidebar
 from src.hud.vignette import apply_vignette
 from src.hud.widgets import (
     draw_mic_meter,
@@ -35,6 +35,8 @@ class HudState:
     pulse_t: float = 0.0
     coaching_status: str = "offline"
     level_threshold_db: float = 42.0
+    ask_draft: str | None = None
+    listening: bool = False
 
 
 class HudRenderer:
@@ -117,7 +119,15 @@ class HudRenderer:
             self.avatar_widget,
             coaching_status=state.coaching_status,
             insights=self.sidebar.visible_insights(state.pulse_t),
+            ask=self.sidebar.visible_ask(state.pulse_t),
         )
+        if state.listening or state.ask_draft is not None:
+            draw_ask_bar(
+                canvas,
+                "" if state.ask_draft is None else state.ask_draft,
+                state.listening,
+                self.theme,
+            )
         if self.opacity >= 0.999:
             return canvas
         return cv2.addWeighted(canvas, self.opacity, frame, 1.0 - self.opacity, 0.0)
@@ -150,6 +160,7 @@ class PreviewWindow:
         self._pygame = None
         self._screen = None
         self._applied: tuple[bool, tuple[int, int]] | None = None
+        self.text_entry = False
 
     def target_size(self) -> tuple[int, int]:
         if self.fullscreen and self.screen_size is not None:
@@ -164,6 +175,8 @@ class PreviewWindow:
         if not name:
             return None
         key = name.lower()
+        if self.text_entry:
+            return key
         if key == "f":
             self.fullscreen = not self.fullscreen
             return "fullscreen" if self.fullscreen else "exit_fullscreen"
@@ -250,18 +263,14 @@ def _key_name(key: int) -> str | None:
     if key in (255, -1):
         return None
     mapping = {
+        8: "backspace",
         32: "space",
         13: "enter",
         27: "escape",
-        ord("q"): "q",
-        ord("f"): "f",
-        ord("t"): "t",
-        ord("m"): "m",
-        ord("s"): "s",
-        ord("["): "[",
-        ord("]"): "]",
-        ord("+"): "+",
-        ord("-"): "-",
-        ord("="): "=",
+        127: "backspace",
     }
-    return mapping.get(key)
+    if key in mapping:
+        return mapping[key]
+    if 32 <= key < 127:
+        return chr(key)
+    return None

@@ -627,6 +627,23 @@ class GemmaClient:
         self._note_success(self.bullets, latency=latency)
         return ("gemma", parsed[0], parsed[1])
 
+    def complete(self, prompt: str) -> str:
+        """Blocking text reply. Does not start, cancel, or join an insight."""
+        if self.offline or (self.transport is None and not self.api_key):
+            raise RuntimeError("Gemma is offline")
+        return self._fetch(prompt)
+
+    def complete_audio(self, prompt: str, audio_wav: bytes) -> str:
+        """Blocking reply with a wav part. The insight slot is left alone.
+
+        A test ``transport`` still receives the text prompt only.
+        """
+        if self.offline or (self.transport is None and not self.api_key):
+            raise RuntimeError("Gemma is offline")
+        if self.transport is not None:
+            return self.transport(prompt)
+        return self._call_google(prompt, audio_wav)
+
     def close(self) -> None:
         """Stop submitting. In-flight calls are daemon threads and are not joined."""
         with self._lock:
@@ -754,7 +771,7 @@ class GemmaClient:
         self._settled.add(job_id)
         return True
 
-    def _call_google(self, prompt: str) -> str:
+    def _call_google(self, prompt: str, audio_wav: bytes | None = None) -> str:
         from google import genai
         from google.genai import types
 
@@ -762,9 +779,16 @@ class GemmaClient:
             api_key=self.api_key,
             http_options=types.HttpOptions(timeout=http_timeout_ms(self.timeout)),
         )
+        if audio_wav is None:
+            contents: str | list = prompt
+        else:
+            contents = [
+                types.Part.from_bytes(data=audio_wav, mime_type="audio/wav"),
+                types.Part.from_text(text=prompt),
+            ]
         response = client.models.generate_content(
             model=self.model,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(
                 max_output_tokens=self.max_output_tokens
             ),
