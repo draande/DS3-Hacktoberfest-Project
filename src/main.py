@@ -184,7 +184,7 @@ def _latency_field(name: str, value: float | None) -> str:
 
 def format_summary(summary: RunSummary) -> str:
     mode = "demo" if summary.demo else "live"
-    coaching = "offline" if summary.fallback else "flash"
+    coaching = "offline" if summary.fallback else "gemma"
     lines = [
         f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | "
         f"insight_ok={summary.insight_ok} insight_failed={summary.insight_failed}"

@@ -92,8 +92,8 @@ audio:
 
 insight:
   # Periodic sidebar trends. Real-time cues do not wait on this.
-  # Override with INSIGHT_MODEL. Paid Flash Lite can be polled tighter
-  # than Gemma; one call stays in flight, and 429/504 still back off.
+  # Override with INSIGHT_MODEL. This model can be polled tighter than
+  # the slow Gemma client; one call stays in flight, and 429/504 still back off.
   model: gemini-3.5-flash-lite
   min_interval_seconds: 8
   # Google rejects deadlines under 10 seconds.

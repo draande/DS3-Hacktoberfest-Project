@@ -121,8 +121,8 @@ class FeedbackSidebar:
 
 
 BADGE_LABELS = {
-    "flash": "FLASH",
-    "gemma": "FLASH",
+    "flash": "GEMMA",
+    "gemma": "GEMMA",
     "thinking": "THINKING",
     "offline": "OFFLINE",
 }

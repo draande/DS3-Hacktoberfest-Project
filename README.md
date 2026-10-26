@@ -51,19 +51,19 @@ Posture, volume, pace, and gaze are decided on the device every frame. If severa
 
 ## Gemma
 
-Two models, used separately. The periodic trend uses `insight.model` (`gemini-3.5-flash-lite`). `INSIGHT_MODEL` overrides it. That call sets thinking to `minimal`, asks for JSON, and caps the reply at `insight.max_output_tokens` (256). The timeout is `insight.timeout_seconds` (10, the shortest deadline Google accepts) and the client is created once and reused. With paid credits the gap between trends is `insight.min_interval_seconds` (8). A 429 or 504 still backs off exponentially. One Flash call is in flight at a time, and that loop does not share a lock or an HTTP client with Gemma.
+Two models, used separately. The periodic trend uses `insight.model` (`gemini-3.5-flash-lite`). `INSIGHT_MODEL` overrides it. That call sets thinking to `minimal`, asks for JSON, and caps the reply at `insight.max_output_tokens` (256). The timeout is `insight.timeout_seconds` (10, the shortest deadline Google accepts) and the client is created once and reused. With paid credits the gap between trends is `insight.min_interval_seconds` (8). A 429 or 504 still backs off exponentially. One trend call is in flight at a time, and that loop does not share a lock or an HTTP client with the slow Gemma client.
 
-Gemma (`gemma.model`, default `gemma-4-26b-a4b-it`, override `GEMMA_MODEL`) is only the slow path: the end-of-session report, and `GemmaClient.generate` for a direct question. It keeps the large output cap (2048) and does not send a thinking config or JSON response mode, because gemma-4 spends hidden thinking tokens and rejects those controls. A Gemma call cannot delay the Flash trend loop. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable either model. With no key, the same slots are filled locally and nothing is sent over the network.
+Gemma (`gemma.model`, default `gemma-4-26b-a4b-it`, override `GEMMA_MODEL`) is only the slow path: the end-of-session report, and `GemmaClient.generate` for a direct question. It keeps the large output cap (2048) and does not send a thinking config or JSON response mode, because gemma-4 spends hidden thinking tokens and rejects those controls. A slow Gemma question or report cannot delay the periodic trend loop. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable either model. With no key, the same slots are filled locally and nothing is sent over the network.
 
 Each insight call sends a compact summary of the last 45 seconds (cue counts, average dB, WPM, gaze-away, posture), not the raw frame history. Every call logs its latency with the model name. The end summary includes `insight_avg` and `gemma_avg` separately.
 
-The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `FLASH` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
+The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `GEMMA` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
 
 When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on either call. The test suite clears the key and model variables and uses fake transports.
 
 ## Ask Gemma
 
-A direct question calls `GemmaClient.generate` on Gemma's own thread. It uses `gemma.model` and `gemma.timeout_seconds`. It does not use the insight client, that client's lock, its SDK client, or its pending flag, and the request does not include a thinking config or a JSON response type. An ask cannot delay the Flash Lite loop. Only one ask is sent at a time. A second question waits until that call returns.
+A direct question calls `GemmaClient.generate` on Gemma's own thread. It uses `gemma.model` and `gemma.timeout_seconds`. It does not use the insight client, that client's lock, its SDK client, or its pending flag, and the request does not include a thinking config or a JSON response type. An ask cannot delay the periodic trend loop. Only one ask is sent at a time. A second question waits until that call returns.
 
 In a preview, `G` opens a one-line bar. Enter sends it, Esc cancels it, and letters typed there do not fire other shortcuts. `F`, Esc, and `Q` behave as usual while the bar is closed. `V` toggles push-to-talk on the microphone samples the frame loop is already reading, and stops on its own after 30 seconds. `--ask "how was my pace?"` prints the question and a 1–3 line reply, then exits without a window or a camera. `--ask` on its own, or `--ask -`, reads one line from stdin.
 

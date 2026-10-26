@@ -4,7 +4,7 @@ import pytest
 from src.config_loader import SidebarConfig, load_config
 from src.hud.avatar import AvatarState, draw_avatar
 from src.hud.renderer import HudRenderer, HudState
-from src.hud.sidebar import FeedbackSidebar, coaching_badge_rect
+from src.hud.sidebar import BADGE_LABELS, FeedbackSidebar, coaching_badge_rect
 from src.hud.vignette import (
     apply_vignette,
     edge_mask,
@@ -233,7 +233,11 @@ def test_renderer_paints_the_sidebar_for_both_themes():
         assert int(strip.max()) > 0
 
 
-def test_coaching_badge_switches_between_flash_thinking_and_offline():
+def test_coaching_badge_reads_gemma_thinking_or_offline():
+    assert BADGE_LABELS["flash"] == "GEMMA"
+    assert BADGE_LABELS["gemma"] == "GEMMA"
+    assert BADGE_LABELS["thinking"] == "THINKING"
+    assert BADGE_LABELS["offline"] == "OFFLINE"
     config = load_config()
     theme = config.theme("ironman")
     renderer = HudRenderer(

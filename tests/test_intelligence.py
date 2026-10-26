@@ -354,6 +354,8 @@ def test_session_report_uses_gemma_or_the_local_summary(tmp_path):
     path = save_report(text, tmp_path)
     saved = path.read_text(encoding="utf-8")
     assert saved.startswith("# Wingman session")
+    assert "Source: offline" in saved
+    assert "Flash" not in saved
     assert "Strengths" in saved and "Work on" in saved
     assert "36 dB" in saved
 
@@ -367,6 +369,9 @@ def test_session_report_uses_gemma_or_the_local_summary(tmp_path):
     )
     source, strengths, improve = live.report(window)
     assert source == "gemma"
+    live_text = render_report_markdown(window, strengths, improve, source)
+    assert "Source: gemma" in live_text
+    assert "Flash" not in live_text
     assert strengths[0].startswith("Clear voice")
     assert len(improve) == 3
     local_strengths, _local_improve = deterministic_report(window)

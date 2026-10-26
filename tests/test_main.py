@@ -40,7 +40,7 @@ def test_summary_reports_each_model_separately():
             gemma_avg=21.0,
         )
     )
-    assert "coaching=flash" in text
+    assert "coaching=gemma" in text
     assert "insight_ok=2" in text
     assert "insight_failed=1" in text
     assert "insight_avg=1.5s" in text
