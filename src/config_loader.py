@@ -136,6 +136,7 @@ class MediaKeyConfig:
     enabled: bool = False
     keys: list[str] = dataclasses.field(default_factory=lambda: ["play_pause"])
     suppress: bool = True
+    backend: str = "auto"
 
 
 @dataclasses.dataclass
@@ -292,6 +293,10 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("ask.media_key.keys must list at least one key")
     for key in config.ask.media_key.keys:
         parse_media_key(key)
+    backend = str(config.ask.media_key.backend).strip().lower()
+    if backend not in {"auto", "smtc", "hook"}:
+        raise ValueError("ask.media_key.backend must be auto, smtc, or hook")
+    config.ask.media_key.backend = backend
     if config.hud.avatar.anchor != "sidebar_top":
         raise ValueError("hud.avatar.anchor must be 'sidebar_top'")
     if not 0 < float(config.hud.avatar.height_ratio) <= 1:

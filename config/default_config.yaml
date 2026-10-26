@@ -117,9 +117,13 @@ gemma:
 ask:
   media_key:
     # Global earbud button for Ask Gemma push-to-talk. Also --earbud.
+    # backend: auto tries the Windows media session (SMTC) first, then the
+    # keyboard hook. smtc needs `uv sync --group earbud` on Windows.
     # keys: play_pause (default), next, previous, stop, headset, or a VK code.
-    # suppress swallows those keys on Windows so music does not also pause.
+    # suppress swallows those keys on the hook only. SMTC owns the session,
+    # so other players may pause while Wingman is running.
     enabled: false
+    backend: auto
     keys:
       - play_pause
     suppress: true

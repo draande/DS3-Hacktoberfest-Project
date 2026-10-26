@@ -37,6 +37,7 @@ def test_default_config_loads_plan_thresholds():
     assert config.ask.media_key.enabled is False
     assert config.ask.media_key.keys == ["play_pause"]
     assert config.ask.media_key.suppress is True
+    assert config.ask.media_key.backend == "auto"
     assert config.posture.calibrate_seconds == 3.0
     assert config.posture.slouch_margin_degrees == 8.0
     assert config.hud.theme == "ironman"
@@ -113,6 +114,16 @@ def test_unknown_thinking_level_is_rejected(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("insight:\n  thinking_level: huge\n", encoding="utf-8")
     with pytest.raises(ValueError, match="thinking_level"):
+        load_config(config_path)
+
+
+def test_unknown_media_backend_is_rejected(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ask:\n  media_key:\n    backend: keyboard\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="backend"):
         load_config(config_path)
 
 

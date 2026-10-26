@@ -306,6 +306,28 @@ def _ask_rows(ask: AskOverlay | None) -> list[str]:
     return rows
 
 
+def draw_earbud_badge(image: np.ndarray, theme: Theme) -> None:
+    """Small EARBUD mark at the top left while a media backend is active."""
+    height, width = image.shape[:2]
+    if height < 18 or width < 64:
+        return
+    accent = hex_to_bgr(theme.colors.get("primary", "#00F0FF"))
+    ink = hex_to_bgr(theme.colors.get("text", "#FFFFFF"))
+    bg = hex_to_bgr(theme.colors.get("background", "#001018"))
+    cv2.rectangle(image, (6, 6), (78, 22), bg, -1)
+    cv2.rectangle(image, (6, 6), (78, 22), accent, 1, cv2.LINE_AA)
+    cv2.putText(
+        image,
+        "EARBUD",
+        (10, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        ink,
+        1,
+        cv2.LINE_AA,
+    )
+
+
 def draw_ask_bar(image: np.ndarray, text: str, listening: bool, theme: Theme) -> None:
     """One line at the bottom of the preview. The frame loop does not wait on it."""
     height, width = image.shape[:2]

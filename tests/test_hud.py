@@ -301,6 +301,18 @@ def test_mic_meter_shows_level_and_the_speak_up_line():
     )
 
 
+def test_earbud_badge_appears_only_while_a_backend_is_active():
+    config = load_config()
+    renderer = HudRenderer(config.theme("ironman"), opacity=1.0)
+    kwargs = dict(
+        remaining_seconds=10, remaining_ratio=0.9, cue=None, volume_db=40, wpm=140
+    )
+    frame = np.zeros((180, 320, 3), np.uint8)
+    off = renderer.render(frame.copy(), HudState(**kwargs, earbud=False))
+    on = renderer.render(frame.copy(), HudState(**kwargs, earbud=True))
+    assert not np.array_equal(on[6:23, 6:79], off[6:23, 6:79])
+
+
 def test_pygame_surface_matches_the_frame_size():
     pytest.importorskip("pygame")
     frame = np.zeros((40, 64, 3), np.uint8)

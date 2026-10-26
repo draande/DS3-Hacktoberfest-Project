@@ -28,7 +28,8 @@ uv run python main.py --demo --timer 20 --display          # preview the edge vi
 uv run python main.py --demo --theme minimalist
 uv run python main.py --offline                            # ignore a Gemma API key
 uv run python main.py --ask "how was my pace?"             # one Gemma reply, then exit
-uv run python main.py --listen-keys                    # print earbud key codes for 15s
+uv sync --group earbud                               # Windows media-session buttons
+uv run python main.py --listen-keys                    # smtc and hook events; Ctrl+C stops
 uv run python main.py --camera 0 --display --earbud    # earbud button toggles Ask Gemma
 ```
 
@@ -73,11 +74,23 @@ The sidebar shows `YOU`, then `THINKING...` with the elapsed seconds, then `ASK`
 
 `gemma-4-26b-a4b-it` does not accept audio, so a spoken ask is transcribed first. `uv sync --group stt` installs `faster-whisper` for that. E2B, E4B, and 12B models can take the wav directly. With no transcriber and a text-only model, the sidebar says to type with `G` instead.
 
-The earbud button is the same push-to-talk action as `V`. `--earbud`, or `ask.media_key.enabled: true`, installs a global listener, so the Wingman window does not have to be focused. The first tap starts recording and the second sends it. It also stops on its own after 30 seconds. The default key is Play/Pause (`VK_MEDIA_PLAY_PAUSE`). `ask.media_key.keys` can also list `next`, `previous`, `stop`, `headset`, or a virtual-key code such as `0xB3`. Down/up pairs and repeats closer than 300 ms count as one tap.
+The earbud button is the same push-to-talk action as `V`. `--earbud`, or `ask.media_key.enabled: true`, installs a global listener, so the Wingman window does not have to be focused. The first tap starts recording and the second sends it. It also stops on its own after 30 seconds. The default button is Play/Pause. `ask.media_key.keys` can also list `next`, `previous`, `stop`, `headset`, or a virtual-key code such as `0xB3`. Down/up pairs and repeats closer than 300 ms count as one tap. The HUD shows `EARBUD` while a backend is active, and startup prints which backend that is.
 
-On Windows the listener is a low-level keyboard hook (`WH_KEYBOARD_LL`) on a background thread. No extra package is required. `ask.media_key.suppress` defaults to true and swallows only the configured keys, so Play/Pause does not also pause music. `--listen-keys` does not swallow; it prints every virtual-key code for 15 seconds so you can see what the button sends. Do not type passwords during that window. If a button prints nothing, Windows is not exposing it as a keyboard key.
+Bluetooth buttons on Windows arrive through the system media session, not as keyboard keys. That backend is the primary one. On Windows:
 
-Off Windows, or if the hook cannot be installed, Wingman logs that once and `V` still works. The hook is removed when the session exits.
+```bash
+uv sync --group earbud
+uv run python main.py --listen-keys
+uv run python main.py --camera 0 --display --earbud
+```
+
+`uv sync --group earbud` installs the WinRT media packages (`winrt-Windows.Media`, `winrt-Windows.Media.Playback`, `winrt-Windows.Media.Core`, and `winrt-Windows.Foundation`). They are Windows-only. Wingman then owns a silent looping session titled "Wingman – Ask Gemma", enables play, pause, next, and previous, and listens for `ButtonPressed`. Play, Pause, and Play/Pause are a tap. Next and previous count only when those keys are listed. While the session is active, Windows routes those buttons to Wingman, so another music app may pause until Wingman exits.
+
+`ask.media_key.backend` is `auto` (default), `smtc`, or `hook`. Auto uses the media session when it starts, and otherwise a low-level keyboard hook (`WH_KEYBOARD_LL`) on a daemon thread. The hook ignores every key that is not in the configured set, so it does not run Python on ordinary typing. `ask.media_key.suppress` defaults to true and applies only to that hook: those keys are swallowed. The media session does not use the flag.
+
+`--listen-keys` starts both backends for about 15 seconds and prefixes each line with `smtc` or `hook`. Ordinary keys are not printed. Ctrl+C stops it. If a button prints nothing, Windows is not exposing it as a media-session button or a media virtual key. Do not type passwords during that window.
+
+Esc, Q, closing the preview, and Ctrl+C in the terminal all end the session and stop the listener (unhook, stop the media player, and join threads). A second Ctrl+C kills the process if the first one is stuck. Off Windows, or if neither backend can start, Wingman logs that once and `V` still works.
 
 ## Hotkeys
 
@@ -94,7 +107,7 @@ Shown while a preview window is open (`--display`):
 | `[` / `]` | More sensitive / less sensitive coaching thresholds |
 | G | Ask Gemma. Type a line, Enter sends, Esc cancels |
 | V | Push-to-talk. Press again to send, or wait 30 seconds |
-| Earbud Play/Pause | Same as V when `--earbud` or `ask.media_key.enabled` is on. Works while the window is unfocused |
+| Earbud Play/Pause | Same as V when `--earbud` or `ask.media_key.enabled` is on. Works while the window is unfocused. The HUD shows EARBUD |
 
 Gestures, from hand landmarks:
 

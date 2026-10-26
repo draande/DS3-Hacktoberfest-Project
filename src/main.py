@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -163,7 +165,10 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
     parser.add_argument(
         "--listen-keys",
         action="store_true",
-        help="Print virtual-key codes for 15 seconds, then exit",
+        help=(
+            "Print earbud events from the media session and the keyboard hook "
+            "for 15 seconds, then exit. Ctrl+C stops early."
+        ),
     )
     args = parser.parse_args(argv)
     demo = bool(args.demo or (args.camera is None and args.video is None))
@@ -232,6 +237,7 @@ def run_session(
     gemma_client: GemmaClient | None = None,
     transcriber: SpeechTranscriber | None = None,
     media_listener: MediaKeyListener | None = None,
+    should_stop=None,
 ) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
@@ -337,10 +343,13 @@ def run_session(
         media_listener = MediaKeyListener(
             keys=list(app_config.ask.media_key.keys),
             suppress=bool(app_config.ask.media_key.suppress),
+            backend=str(app_config.ask.media_key.backend),
         )
     if media_listener is not None and not media_listener.started:
-        if not media_listener.start():
-            summary.notes.append("Earbud button unavailable. Press V for push-to-talk.")
+        media_listener.start()
+        line = media_listener.status_line()
+        print(line, flush=True)
+        summary.notes.append(line)
     playback = _start_playback(options, app_config.audio.sample_rate, summary)
 
     scene = (
@@ -407,6 +416,9 @@ def run_session(
     pace_clock = time.perf_counter()
     try:
         while frame_limit is None or frame_index < frame_limit:
+            if should_stop is not None and should_stop():
+                summary.notes.append("Stopped.")
+                break
             timestamp = frame_index / fps
             if preview is not None:
                 target_w, target_h = preview.target_size()
@@ -585,6 +597,7 @@ def run_session(
                     level_threshold_db=control.effective_speak_up_db(),
                     ask_draft=None if not composer.open else composer.text,
                     listening=recorder.active,
+                    earbud=media_listener is not None and media_listener.active,
                 ),
             )
             if summary.first_frame is None:
@@ -602,6 +615,8 @@ def run_session(
                 key = preview.show(rendered)
                 dispatched = dispatch_preview_key(key, composer, control, timestamp)
                 if dispatched.quit:
+                    break
+                if preview.closed():
                     break
                 if dispatched.submitted:
                     asker.submit(
@@ -630,6 +645,8 @@ def run_session(
                 else:
                     pace_clock = time.perf_counter()
             frame_index += 1
+    except KeyboardInterrupt:
+        summary.notes.append("Stopped.")
     finally:
         if video is not None:
             video.close()
@@ -761,10 +778,39 @@ def run_cli_ask(
     return format_ask_output(question, state)
 
 
+def _install_stop_handler(stop_event: threading.Event):
+    """First Ctrl+C asks the loop to finish. The next one kills the process."""
+    previous = signal.getsignal(signal.SIGINT)
+
+    def _request_stop(signum, frame):
+        del signum, frame
+        stop_event.set()
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _request_stop)
+    except ValueError:
+        return None
+    return previous
+
+
 def main(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
+    stop_event = threading.Event()
+    previous_sigint = _install_stop_handler(stop_event)
+    try:
+        return _main_with_stop(options, stop_event.is_set)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
+
+
+def _main_with_stop(options: RunOptions, should_stop) -> int:
     if options.listen_keys:
-        return listen_for_keys()
+        return listen_for_keys(stop=should_stop)
     if options.ask is not None:
         question = options.ask
         if question == "-":
@@ -776,10 +822,10 @@ def main(argv: list[str] | None = None) -> int:
         print(run_cli_ask(question, offline=options.offline))
         return 0
     if options.download_models:
-        summary = run_session(options)
+        summary = run_session(options, should_stop=should_stop)
         print(format_summary(summary))
         return 0 if summary.error is None else 1
-    summary = run_session(options)
+    summary = run_session(options, should_stop=should_stop)
     print(format_summary(summary))
     if summary.report:
         print()
