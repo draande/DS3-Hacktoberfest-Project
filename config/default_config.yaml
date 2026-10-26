@@ -113,3 +113,13 @@ gemma:
   timeout_seconds: 45
   report_timeout_seconds: 90
   max_output_tokens: 2048
+
+ask:
+  media_key:
+    # Global earbud button for Ask Gemma push-to-talk. Also --earbud.
+    # keys: play_pause (default), next, previous, stop, headset, or a VK code.
+    # suppress swallows those keys on Windows so music does not also pause.
+    enabled: false
+    keys:
+      - play_pause
+    suppress: true

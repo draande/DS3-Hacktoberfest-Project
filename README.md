@@ -28,6 +28,8 @@ uv run python main.py --demo --timer 20 --display          # preview the edge vi
 uv run python main.py --demo --theme minimalist
 uv run python main.py --offline                            # ignore a Gemma API key
 uv run python main.py --ask "how was my pace?"             # one Gemma reply, then exit
+uv run python main.py --listen-keys                    # print earbud key codes for 15s
+uv run python main.py --camera 0 --display --earbud    # earbud button toggles Ask Gemma
 ```
 
 `--timer 20` shortens the presentation clock so the border glow moves from clear, to amber under 25% remaining, to red under 10%. The config default is a 5 minute talk.
@@ -71,6 +73,12 @@ The sidebar shows `YOU`, then `THINKING...` with the elapsed seconds, then `ASK`
 
 `gemma-4-26b-a4b-it` does not accept audio, so a spoken ask is transcribed first. `uv sync --group stt` installs `faster-whisper` for that. E2B, E4B, and 12B models can take the wav directly. With no transcriber and a text-only model, the sidebar says to type with `G` instead.
 
+The earbud button is the same push-to-talk action as `V`. `--earbud`, or `ask.media_key.enabled: true`, installs a global listener, so the Wingman window does not have to be focused. The first tap starts recording and the second sends it. It also stops on its own after 30 seconds. The default key is Play/Pause (`VK_MEDIA_PLAY_PAUSE`). `ask.media_key.keys` can also list `next`, `previous`, `stop`, `headset`, or a virtual-key code such as `0xB3`. Down/up pairs and repeats closer than 300 ms count as one tap.
+
+On Windows the listener is a low-level keyboard hook (`WH_KEYBOARD_LL`) on a background thread. No extra package is required. `ask.media_key.suppress` defaults to true and swallows only the configured keys, so Play/Pause does not also pause music. `--listen-keys` does not swallow; it prints every virtual-key code for 15 seconds so you can see what the button sends. Do not type passwords during that window. If a button prints nothing, Windows is not exposing it as a keyboard key.
+
+Off Windows, or if the hook cannot be installed, Wingman logs that once and `V` still works. The hook is removed when the session exits.
+
 ## Hotkeys
 
 Shown while a preview window is open (`--display`):
@@ -86,6 +94,7 @@ Shown while a preview window is open (`--display`):
 | `[` / `]` | More sensitive / less sensitive coaching thresholds |
 | G | Ask Gemma. Type a line, Enter sends, Esc cancels |
 | V | Push-to-talk. Press again to send, or wait 30 seconds |
+| Earbud Play/Pause | Same as V when `--earbud` or `ask.media_key.enabled` is on. Works while the window is unfocused |
 
 Gestures, from hand landmarks:
 

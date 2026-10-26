@@ -130,6 +130,22 @@ class GemmaConfig:
 
 
 @dataclasses.dataclass
+class MediaKeyConfig:
+    """Global earbud button. Off unless enabled or the session is started with --earbud."""
+
+    enabled: bool = False
+    keys: list[str] = dataclasses.field(default_factory=lambda: ["play_pause"])
+    suppress: bool = True
+
+
+@dataclasses.dataclass
+class AskConfig:
+    """Ask Gemma input. The insight loop does not read this."""
+
+    media_key: MediaKeyConfig = dataclasses.field(default_factory=MediaKeyConfig)
+
+
+@dataclasses.dataclass
 class Theme:
     key: str
     name: str
@@ -152,6 +168,7 @@ class AppConfig:
     audio: AudioStreamConfig = dataclasses.field(default_factory=AudioStreamConfig)
     insight: InsightConfig = dataclasses.field(default_factory=InsightConfig)
     gemma: GemmaConfig = dataclasses.field(default_factory=GemmaConfig)
+    ask: AskConfig = dataclasses.field(default_factory=AskConfig)
     themes: dict[str, Theme] = dataclasses.field(default_factory=dict)
 
     def theme(self, name: str | None = None) -> Theme:
@@ -269,6 +286,12 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("posture.slouch_margin_degrees must be positive")
     if float(config.posture.forward_margin) <= 0:
         raise ValueError("posture.forward_margin must be positive")
+    from src.audio.media_keys import parse_media_key
+
+    if not list(config.ask.media_key.keys):
+        raise ValueError("ask.media_key.keys must list at least one key")
+    for key in config.ask.media_key.keys:
+        parse_media_key(key)
     if config.hud.avatar.anchor != "sidebar_top":
         raise ValueError("hud.avatar.anchor must be 'sidebar_top'")
     if not 0 < float(config.hud.avatar.height_ratio) <= 1:

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from src.audio.audio_feedback import AudioOutput, chime_for_cue
+from src.audio.media_keys import MediaKeyListener, listen_for_keys
 from src.audio.pace_analyzer import PaceAnalyzer
 from src.audio.speech_transcriber import (
     SpeechTranscriber,
@@ -60,6 +61,8 @@ class RunOptions:
     offline: bool = False
     download_models: bool = False
     ask: str | None = None
+    earbud: bool = False
+    listen_keys: bool = False
 
 
 @dataclass
@@ -152,6 +155,16 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         default=None,
         help="Ask Gemma one question and exit. Omit the text, or pass -, to read stdin.",
     )
+    parser.add_argument(
+        "--earbud",
+        action="store_true",
+        help="Listen for the earbud Play/Pause button even when the window is not focused",
+    )
+    parser.add_argument(
+        "--listen-keys",
+        action="store_true",
+        help="Print virtual-key codes for 15 seconds, then exit",
+    )
     args = parser.parse_args(argv)
     demo = bool(args.demo or (args.camera is None and args.video is None))
     if args.camera is not None or args.video is not None:
@@ -173,6 +186,8 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         offline=args.offline,
         download_models=args.download_models,
         ask=args.ask,
+        earbud=args.earbud,
+        listen_keys=args.listen_keys,
     )
 
 
@@ -216,6 +231,7 @@ def run_session(
     insight_client: InsightClient | None = None,
     gemma_client: GemmaClient | None = None,
     transcriber: SpeechTranscriber | None = None,
+    media_listener: MediaKeyListener | None = None,
 ) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
@@ -317,6 +333,14 @@ def run_session(
     composer = AskComposer()
     recorder = SpeechRecorder()
     transcriber_box: dict[str, SpeechTranscriber | None] = {"value": transcriber}
+    if media_listener is None and (options.earbud or app_config.ask.media_key.enabled):
+        media_listener = MediaKeyListener(
+            keys=list(app_config.ask.media_key.keys),
+            suppress=bool(app_config.ask.media_key.suppress),
+        )
+    if media_listener is not None and not media_listener.started:
+        if not media_listener.start():
+            summary.notes.append("Earbud button unavailable. Press V for push-to-talk.")
     playback = _start_playback(options, app_config.audio.sample_rate, summary)
 
     scene = (
@@ -351,6 +375,8 @@ def run_session(
         except (CameraUnavailable, FileNotFoundError, RuntimeError) as exc:
             summary.error = str(exc)
             asker.close()
+            if media_listener is not None:
+                media_listener.stop()
             insight_client.close()
             gemma_client.close()
             if playback is not None:
@@ -501,6 +527,16 @@ def run_session(
                     timestamp,
                     _transcriber(transcriber_box),
                 )
+            if media_listener is not None:
+                for _tap in range(media_listener.pop_taps()):
+                    _toggle_push_to_talk(
+                        recorder,
+                        asker,
+                        gemma_client.model,
+                        stats.recent(timestamp),
+                        timestamp,
+                        transcriber_box,
+                    )
             active = control.filter.consider_many(
                 active_cues(metrics, app_config.cues.duration_ms), timestamp
             )
@@ -572,15 +608,14 @@ def run_session(
                         dispatched.submitted, stats.recent(timestamp), now=timestamp
                     )
                 if dispatched.speech_toggle:
-                    if recorder.toggle() == "stop":
-                        _send_spoken_ask(
-                            asker,
-                            gemma_client.model,
-                            recorder.take(),
-                            stats.recent(timestamp),
-                            timestamp,
-                            _transcriber(transcriber_box),
-                        )
+                    _toggle_push_to_talk(
+                        recorder,
+                        asker,
+                        gemma_client.model,
+                        stats.recent(timestamp),
+                        timestamp,
+                        transcriber_box,
+                    )
                 if dispatched.action:
                     summary.actions.append((timestamp, dispatched.action))
                 if control.theme_name != renderer.theme.key:
@@ -606,6 +641,8 @@ def run_session(
             preview.close()
         if playback is not None:
             playback.close()
+        if media_listener is not None:
+            media_listener.stop()
         window = stats.overall(summary.duration)
         asker.close()
         source, strengths, improve = gemma_client.report(window)
@@ -654,6 +691,26 @@ def _transcriber(
         if box.get("value") is None:
             box["value"] = load_transcriber()
     return box.get("value")
+
+
+def _toggle_push_to_talk(
+    recorder: SpeechRecorder,
+    asker: AskGemma,
+    model: str,
+    window,
+    now: float,
+    transcriber_box: dict,
+) -> None:
+    """Same action as V and as an earbud tap. The frame loop calls this."""
+    if recorder.toggle() == "stop":
+        _send_spoken_ask(
+            asker,
+            model,
+            recorder.take(),
+            window,
+            now,
+            _transcriber(transcriber_box),
+        )
 
 
 def _send_spoken_ask(
@@ -706,6 +763,8 @@ def run_cli_ask(
 
 def main(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
+    if options.listen_keys:
+        return listen_for_keys()
     if options.ask is not None:
         question = options.ask
         if question == "-":
