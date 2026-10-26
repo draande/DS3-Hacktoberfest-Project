@@ -2,6 +2,9 @@
 
 Wingman is a smart-glasses presentation coach. It watches posture, gaze, audience expressions, and speaking pace, then shows a short cue on a heads-up display. The demo runs on synthetic landmarks and generated audio, so you do not need glasses, a webcam, a microphone, or an API key.
 
+## Walkthrough
+https://youtu.be/U2cPfduU50E
+
 ## Setup
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
