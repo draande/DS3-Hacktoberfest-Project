@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 
 from src.config_loader import GemmaConfig, load_config
@@ -19,6 +20,13 @@ from src.intelligence.gemma_client import (
     parse_cue_json,
     parse_insight_json,
     render_report_markdown,
+)
+from google.genai import types
+
+from src.intelligence.insight_client import (
+    DEFAULT_INSIGHT_MODEL,
+    InsightClient,
+    flash_request_config,
 )
 from src.intelligence.session_stats import save_report
 
@@ -152,17 +160,17 @@ def test_client_uses_transport_json_and_falls_back_when_it_is_garbage():
     def good_transport(_prompt: str) -> str:
         return '{"bullets":["Posture slipping often"]}'
 
-    client = GemmaClient(api_key="test-key", transport=good_transport)
+    client = InsightClient(api_key="test-key", transport=good_transport)
     bullets = client.insights(window)
     assert bullets == ["Posture slipping often"]
     assert client.used_fallback is False
     assert "db=" in build_prompt(window)
 
-    broken = GemmaClient(api_key="test-key", transport=lambda _prompt: "not json")
+    broken = InsightClient(api_key="test-key", transport=lambda _prompt: "not json")
     assert broken.insights(window) is None
     assert broken.used_fallback is True
 
-    quiet = GemmaClient(api_key=None)
+    quiet = InsightClient(api_key=None)
     assert quiet.insights(CoachWindow()) is None
     assert quiet.used_fallback is True
 
@@ -176,6 +184,11 @@ def test_gemma_model_env_overrides_the_config(monkeypatch):
     monkeypatch.setenv("GEMMA_MODEL", "   ")
     blank = GemmaClient.from_env(DEFAULT_MODEL, 3000, offline=True)
     assert blank.model == DEFAULT_MODEL
+    assert load_config().insight.model == DEFAULT_INSIGHT_MODEL
+    monkeypatch.setenv("INSIGHT_MODEL", "gemini-custom-flash")
+    flash = InsightClient.from_env(load_config().insight.model, offline=True)
+    assert flash.model == "gemini-custom-flash"
+    assert overridden.model == "gemma-custom-model"
 
 
 def test_poll_does_not_block_on_a_slow_transport():
@@ -183,7 +196,9 @@ def test_poll_does_not_block_on_a_slow_transport():
         time.sleep(1.5)
         return '{"bullets":["Pace steadier now"]}'
 
-    client = GemmaClient(api_key="test-key", transport=slow, min_interval=0, timeout=5)
+    client = InsightClient(
+        api_key="test-key", transport=slow, min_interval=0, timeout=5
+    )
     window = CoachWindow(avg_wpm=150, seconds=30)
     started = time.perf_counter()
     results = [client.poll(window, now=float(i)) for i in range(12)]
@@ -196,9 +211,9 @@ def test_poll_does_not_block_on_a_slow_transport():
 
 
 def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
-    caplog.set_level(logging.WARNING, logger="wingman.gemma")
+    caplog.set_level(logging.WARNING, logger="wingman.insight")
     window = CoachWindow(posture_ratio=0.6, avg_db=36, seconds=40)
-    good = GemmaClient(
+    good = InsightClient(
         api_key="test-key",
         transport=lambda _prompt: '{"bullets":["Posture slipping often"]}',
         min_interval=2,
@@ -209,7 +224,7 @@ def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
     _wait_until(lambda: not good.pending)
     shown = good.poll(window, now=0.2)
     assert shown == ["Posture slipping often"]
-    assert good.status == "gemma"
+    assert good.status == "flash"
     assert good.succeeded == 1
     assert good.failed == 0
     assert good.used_fallback is False
@@ -221,7 +236,7 @@ def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
         error.code = 404
         raise error
 
-    bad = GemmaClient(
+    bad = InsightClient(
         api_key="test-key", transport=raise_404, min_interval=1, timeout=2
     )
     bad.poll(window, now=0)
@@ -234,12 +249,12 @@ def test_finished_gemma_result_is_shown_and_errors_are_counted_once(caplog):
     warnings = [
         record.getMessage()
         for record in caplog.records
-        if record.name == "wingman.gemma"
+        if record.name == "wingman.insight"
     ]
-    assert warnings == ["Gemma call failed: 404 NOT_FOUND"]
+    assert warnings == [f"{DEFAULT_INSIGHT_MODEL} call failed: 404 NOT_FOUND"]
     assert bad.succeeded == 0
 
-    messy = GemmaClient(
+    messy = InsightClient(
         api_key="test-key",
         transport=lambda _prompt: "not json",
         min_interval=0,
@@ -256,7 +271,7 @@ def test_a_timed_out_call_is_a_failure_and_poll_does_not_wait_for_it():
         time.sleep(0.6)
         return _ENCOURAGE
 
-    client = GemmaClient(
+    client = InsightClient(
         api_key="test-key", transport=slow, min_interval=5, timeout=0.15
     )
     started = time.perf_counter()
@@ -273,7 +288,7 @@ def test_a_timed_out_call_is_a_failure_and_poll_does_not_wait_for_it():
 
 
 def test_empty_insight_json_does_not_invent_a_trend():
-    client = GemmaClient(
+    client = InsightClient(
         api_key="test-key",
         transport=lambda _prompt: '{"bullets":[]}',
     )
@@ -298,14 +313,14 @@ def test_posture_yields_so_volume_is_also_shown():
 
 
 def test_retryable_gemma_errors_back_off(caplog):
-    caplog.set_level(logging.INFO, logger="wingman.gemma")
+    caplog.set_level(logging.INFO, logger="wingman.insight")
 
     def raise_504(_prompt: str) -> str:
         error = RuntimeError("DEADLINE_EXCEEDED")
         error.code = 504
         raise error
 
-    client = GemmaClient(
+    client = InsightClient(
         api_key="test-key", transport=raise_504, min_interval=10, timeout=2
     )
     window = CoachWindow(avg_db=33, seconds=30)
@@ -339,6 +354,8 @@ def test_session_report_uses_gemma_or_the_local_summary(tmp_path):
     path = save_report(text, tmp_path)
     saved = path.read_text(encoding="utf-8")
     assert saved.startswith("# Wingman session")
+    assert "Source: offline" in saved
+    assert "Flash" not in saved
     assert "Strengths" in saved and "Work on" in saved
     assert "36 dB" in saved
 
@@ -352,6 +369,9 @@ def test_session_report_uses_gemma_or_the_local_summary(tmp_path):
     )
     source, strengths, improve = live.report(window)
     assert source == "gemma"
+    live_text = render_report_markdown(window, strengths, improve, source)
+    assert "Source: gemma" in live_text
+    assert "Flash" not in live_text
     assert strengths[0].startswith("Clear voice")
     assert len(improve) == 3
     local_strengths, _local_improve = deterministic_report(window)
@@ -389,3 +409,85 @@ def test_global_gap_spaces_different_cue_types():
     assert cue_filter.consider(first, 0.0) is not None
     assert cue_filter.consider(second, 0.2) is None
     assert cue_filter.consider(second, 1.0)["cue_type"] == "GAZE"
+
+
+def test_flash_reuses_one_client_and_requests_minimal_json():
+    class Response:
+        text = '{"bullets":["Pace steadier now"]}'
+
+    class Models:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            return Response()
+
+    class Sdk:
+        def __init__(self) -> None:
+            self.models = Models()
+
+    insight = InsightClient(api_key="test-key", max_output_tokens=256)
+    sdk = Sdk()
+    insight._sdk = sdk
+    assert insight._call_google("first") == Response.text
+    assert insight._call_google("second") == Response.text
+    assert insight._sdk is sdk
+    assert len(sdk.models.calls) == 2
+    config = sdk.models.calls[0]["config"]
+    assert config.max_output_tokens == 256
+    assert config.response_mime_type == "application/json"
+    assert config.thinking_config.thinking_level == types.ThinkingLevel.MINIMAL
+    built = flash_request_config(256, "minimal")
+    assert built.thinking_config.thinking_level == types.ThinkingLevel.MINIMAL
+
+    gemma = GemmaClient(api_key="test-key", max_output_tokens=2048)
+    gemma_sdk = Sdk()
+    gemma._sdk = gemma_sdk
+
+    class GemmaResponse:
+        text = "report"
+
+    gemma_sdk.models.generate_content = lambda **kwargs: (
+        gemma_sdk.models.calls.append(kwargs) or GemmaResponse()
+    )
+    assert gemma.generate("slow question") == "report"
+    assert gemma.generate("another") == "report"
+    assert gemma._sdk is gemma_sdk
+    gemma_config = gemma_sdk.models.calls[0]["config"]
+    assert gemma_config.max_output_tokens == 2048
+    assert gemma_config.response_mime_type is None
+    assert gemma_config.thinking_config is None
+
+
+def test_a_slow_gemma_call_does_not_delay_the_flash_loop():
+    started = threading.Event()
+
+    def slow_gemma(_prompt: str) -> str:
+        started.set()
+        time.sleep(0.8)
+        return (
+            '{"strengths":["Clear voice throughout.","Steady eye contact today.",'
+            '"Calm opening pace."],"improve":["Sit taller after the start.",'
+            '"Pause between the sections.","Lift the quiet middle third."]}'
+        )
+
+    gemma = GemmaClient(api_key="test-key", transport=slow_gemma, report_timeout=2)
+    insight = InsightClient(
+        api_key="test-key",
+        transport=lambda _prompt: '{"bullets":["Pace steadier now"]}',
+        min_interval=0,
+        timeout=2,
+    )
+    worker = threading.Thread(target=lambda: gemma.report(CoachWindow(seconds=30)))
+    worker.start()
+    assert started.wait(1)
+    began = time.perf_counter()
+    insight.poll(CoachWindow(avg_wpm=150, seconds=20), now=0)
+    _wait_until(lambda: insight.bullets == ["Pace steadier now"])
+    assert time.perf_counter() - began < 0.4
+    assert insight.succeeded == 1
+    worker.join(timeout=2)
+    assert gemma.succeeded == 1
+    insight.close()
+    gemma.close()

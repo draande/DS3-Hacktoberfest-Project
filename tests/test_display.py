@@ -124,6 +124,39 @@ def test_show_escape_leaves_fullscreen_before_a_second_escape_quits():
     assert window.show(frame) == "quit"
 
 
+def test_closed_window_is_detected_without_requiring_get_window_property():
+    plain = FakeCv2()
+    window = PreviewWindow(
+        screen_size=(80, 48), windowed_size=(80, 48), fullscreen=False, cv2_module=plain
+    )
+    assert window.closed() is False
+    window.show(np.zeros((48, 80, 3), np.uint8))
+    assert window.closed() is False
+
+    class Closed(FakeCv2):
+        WND_PROP_VISIBLE = 4
+
+        def getWindowProperty(self, title, prop):
+            assert title == "Wingman"
+            assert prop == self.WND_PROP_VISIBLE
+            return 0
+
+    closed = PreviewWindow(
+        screen_size=(80, 48),
+        windowed_size=(80, 48),
+        fullscreen=False,
+        cv2_module=Closed(),
+    )
+    assert closed.closed() is True
+
+    class Explodes(FakeCv2):
+        def getWindowProperty(self, title, prop):
+            raise RuntimeError("no window")
+
+    fragile = PreviewWindow(cv2_module=Explodes(), fullscreen=False)
+    assert fragile.closed() is False
+
+
 def test_detect_screen_size_does_not_crash_without_a_display():
     size = detect_screen_size()
     assert size is None or (size[0] > 0 and size[1] > 0)

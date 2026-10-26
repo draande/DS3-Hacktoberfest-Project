@@ -10,7 +10,18 @@ import numpy as np
 from src.config_loader import Theme
 from src.hud.avatar import AvatarState, AvatarWidget
 from src.hud.widgets import WidgetBox, hex_to_bgr
+from src.intelligence.ask_gemma import answer_ttl
 from src.intelligence.gemma_client import normalize_bullets
+
+
+@dataclass
+class AskOverlay:
+    """Direct question drawn under the cue lines. It outlives a transient bullet."""
+
+    question: str
+    phase: str
+    lines: tuple[str, ...]
+    elapsed: int
 
 
 @dataclass
@@ -33,6 +44,12 @@ class FeedbackSidebar:
         self.fade_seconds = max(0.0, float(fade_seconds))
         self._items: list[_Bullet] = []
         self._insights: list[_Bullet] = []
+        self._ask_question = ""
+        self._ask_phase = "idle"
+        self._ask_lines: tuple[str, ...] = ()
+        self._ask_started: float | None = None
+        self._ask_signature: tuple | None = None
+        self._ask_at = 0.0
 
     def push(self, texts, now: float) -> None:
         incoming = normalize_bullets(texts)
@@ -52,6 +69,40 @@ class FeedbackSidebar:
         del now
         return [(item.text, 1.0) for item in self._insights]
 
+    def show_ask(
+        self,
+        question: str,
+        phase: str,
+        lines,
+        started_at: float | None,
+        now: float,
+    ) -> None:
+        """Remember the latest ask. Repeating the same reply does not reset its clock."""
+        signature = (phase, question, tuple(lines or ()))
+        if signature != self._ask_signature:
+            self._ask_signature = signature
+            self._ask_at = float(now)
+        self._ask_question = question
+        self._ask_phase = phase
+        self._ask_lines = tuple(lines or ())
+        self._ask_started = started_at
+
+    def visible_ask(self, now: float) -> AskOverlay | None:
+        phase = self._ask_phase
+        if phase == "idle":
+            return None
+        if phase != "thinking" and float(now) - self._ask_at >= answer_ttl(phase):
+            return None
+        elapsed = 0
+        if self._ask_started is not None:
+            elapsed = max(0, int(float(now) - self._ask_started))
+        return AskOverlay(
+            question=self._ask_question,
+            phase=phase,
+            lines=self._ask_lines,
+            elapsed=elapsed,
+        )
+
     def visible(self, now: float) -> list[tuple[str, float]]:
         shown: list[tuple[str, float]] = []
         fade = self.fade_seconds
@@ -69,11 +120,16 @@ class FeedbackSidebar:
         return shown
 
 
-BADGE_LABELS = {"gemma": "GEMMA", "thinking": "THINKING", "offline": "OFFLINE"}
+BADGE_LABELS = {
+    "flash": "GEMMA",
+    "gemma": "GEMMA",
+    "thinking": "THINKING",
+    "offline": "OFFLINE",
+}
 
 
 def coaching_badge_rect(panel: WidgetBox) -> tuple[int, int, int, int]:
-    """Small strip at the bottom of the sidebar for the Gemma status."""
+    """Small strip at the bottom of the sidebar for the insight-model status."""
     height = 16 if panel.h >= 40 else max(4, panel.h // 5)
     height = min(height, max(1, panel.h))
     inset = 2 if panel.w > 8 else 0
@@ -93,8 +149,9 @@ def draw_sidebar(
     avatar_widget: AvatarWidget,
     coaching_status: str = "offline",
     insights: list[tuple[str, float]] | None = None,
+    ask: AskOverlay | None = None,
 ) -> None:
-    """Fill the side panel, paint the avatar slot, then cue and insight lines."""
+    """Fill the side panel, paint the avatar slot, then cue, insight, and ask lines."""
     if panel.w <= 1 or panel.h <= 1:
         return
     _fill_panel(image, panel, theme)
@@ -104,7 +161,7 @@ def draw_sidebar(
         (avatar_box.x, avatar_box.y, avatar_box.w, avatar_box.h),
         avatar_state,
     )
-    _draw_bullets(image, panel, avatar_box, bullets, theme, insights or [])
+    _draw_bullets(image, panel, avatar_box, bullets, theme, insights or [], ask)
     _draw_coaching_badge(image, panel, theme, coaching_status)
 
 
@@ -152,6 +209,7 @@ def _draw_bullets(
     bullets: list[tuple[str, float]],
     theme: Theme,
     insights: list[tuple[str, float]],
+    ask: AskOverlay | None = None,
 ) -> None:
     text_color = hex_to_bgr(theme.colors.get("text", "#FFFFFF"))
     font = (
@@ -164,7 +222,9 @@ def _draw_bullets(
     x = panel.x + max(6, panel.w // 18)
     y = avatar_box.y + avatar_box.h + line_h
     _badge_x, badge_y, _badge_w, _badge_h = coaching_badge_rect(panel)
-    bottom = min(panel.y + panel.h - 6, badge_y - 4)
+    ask_rows = _ask_rows(ask)
+    reserve = line_h * len(ask_rows)
+    bottom = min(panel.y + panel.h - 6, badge_y - 4) - reserve
     for text, alpha in bullets:
         if y > bottom:
             break
@@ -212,6 +272,88 @@ def _draw_bullets(
                 cv2.LINE_AA,
             )
             y += line_h
+    y_ask = bottom + line_h
+    for row in ask_rows:
+        if y_ask > badge_y - 2:
+            break
+        cv2.putText(
+            image,
+            row,
+            (x, y_ask),
+            font,
+            scale,
+            text_color,
+            1,
+            cv2.LINE_AA,
+        )
+        y_ask += line_h
+
+
+def _ask_rows(ask: AskOverlay | None) -> list[str]:
+    if ask is None:
+        return []
+    rows: list[str] = []
+    if ask.question:
+        question = ask.question
+        if len(question) > 48:
+            question = question[:47] + "..."
+        rows.append(f"YOU: {question}")
+    if ask.phase == "thinking":
+        rows.append(f"THINKING... {ask.elapsed}s")
+        return rows
+    rows.append("ASK")
+    rows.extend(ask.lines[:3])
+    return rows
+
+
+def draw_earbud_badge(image: np.ndarray, theme: Theme) -> None:
+    """Small EARBUD mark at the top left while a media backend is active."""
+    height, width = image.shape[:2]
+    if height < 18 or width < 64:
+        return
+    accent = hex_to_bgr(theme.colors.get("primary", "#00F0FF"))
+    ink = hex_to_bgr(theme.colors.get("text", "#FFFFFF"))
+    bg = hex_to_bgr(theme.colors.get("background", "#001018"))
+    cv2.rectangle(image, (6, 6), (78, 22), bg, -1)
+    cv2.rectangle(image, (6, 6), (78, 22), accent, 1, cv2.LINE_AA)
+    cv2.putText(
+        image,
+        "EARBUD",
+        (10, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        ink,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def draw_ask_bar(image: np.ndarray, text: str, listening: bool, theme: Theme) -> None:
+    """One line at the bottom of the preview. The frame loop does not wait on it."""
+    height, width = image.shape[:2]
+    if height < 16 or width < 20:
+        return
+    bar_h = min(28, max(14, height // 12))
+    y0 = height - bar_h
+    color = hex_to_bgr(theme.colors.get("background", "#001018"))
+    accent = hex_to_bgr(theme.colors.get("primary", "#FFFFFF"))
+    ink = hex_to_bgr(theme.colors.get("text", "#FFFFFF"))
+    cv2.rectangle(image, (0, y0), (width - 1, height - 1), color, -1)
+    cv2.line(image, (0, y0), (width - 1, y0), accent, 1, cv2.LINE_AA)
+    if listening:
+        label = "Listening... press V to send"
+    else:
+        label = f"Ask Gemma: {text}_"
+    cv2.putText(
+        image,
+        label[: max(8, width // 8)],
+        (8, height - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        ink,
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def _draw_coaching_badge(
@@ -226,7 +368,12 @@ def _draw_coaching_badge(
     if x1 <= x0 or y1 <= y0:
         return
     kind = status if status in BADGE_LABELS else "offline"
-    role = {"gemma": "primary", "thinking": "warning", "offline": "neutral"}[kind]
+    role = {
+        "flash": "primary",
+        "gemma": "primary",
+        "thinking": "warning",
+        "offline": "neutral",
+    }[kind]
     color = hex_to_bgr(theme.colors.get(role, "#7A8B99"))
     cv2.rectangle(image, (x0, y0), (x1 - 1, y1 - 1), color, -1)
     if height < 12 or width < 36:
