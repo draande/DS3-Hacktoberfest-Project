@@ -38,6 +38,13 @@ def test_default_config_loads_plan_thresholds():
     assert config.ask.media_key.keys == ["play_pause"]
     assert config.ask.media_key.suppress is True
     assert config.ask.media_key.backend == "auto"
+    assert config.summary.enabled is True
+    assert config.summary.interval_seconds == 20
+    assert config.summary.max_output_tokens == 512
+    assert config.voice.enabled is True
+    assert config.voice.voice_id == "eve"
+    assert config.voice.language == "en"
+    assert config.voice.playback is True
     assert config.posture.calibrate_seconds == 3.0
     assert config.posture.slouch_margin_degrees == 8.0
     assert config.hud.theme == "ironman"
@@ -114,6 +121,13 @@ def test_unknown_thinking_level_is_rejected(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("insight:\n  thinking_level: huge\n", encoding="utf-8")
     with pytest.raises(ValueError, match="thinking_level"):
+        load_config(config_path)
+
+
+def test_voice_id_must_not_be_empty(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("voice:\n  voice_id: '  '\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="voice_id"):
         load_config(config_path)
 
 

@@ -9,6 +9,7 @@ for _name in (
     "GEMINI_API_KEY",
     "GEMMA_MODEL",
     "INSIGHT_MODEL",
+    "XAI_API_KEY",
 ):
     os.environ.pop(_name, None)
 

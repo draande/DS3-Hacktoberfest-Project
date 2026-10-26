@@ -414,6 +414,7 @@ def render_report_markdown(
     strengths: list[str],
     improve: list[str],
     source: str,
+    talk_summary: str = "",
 ) -> str:
     counts = (
         ", ".join(f"{key} {value}" for key, value in sorted(window.cue_counts.items()))
@@ -421,9 +422,13 @@ def render_report_markdown(
     )
     strength_lines = "\n".join(f"- {line}" for line in strengths)
     improve_lines = "\n".join(f"- {line}" for line in improve)
+    conversation = ""
+    if talk_summary and str(talk_summary).strip():
+        conversation = f"## Conversation\n\n{str(talk_summary).strip()}\n\n"
     return (
         "# Wingman session\n\n"
         f"Source: {source}\n\n"
+        f"{conversation}"
         "## Strengths\n\n"
         f"{strength_lines}\n\n"
         "## Work on\n\n"

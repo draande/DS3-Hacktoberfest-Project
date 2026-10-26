@@ -127,3 +127,22 @@ ask:
     keys:
       - play_pause
     suppress: true
+
+summary:
+  # Running summary of the talk on the Flash Lite insight model.
+  # Each update sends the previous summary plus the new stretch only.
+  # It does not call Gemma. Speech text needs `uv sync --group stt`.
+  enabled: true
+  interval_seconds: 20
+  max_output_tokens: 512
+
+voice:
+  # After the session, Grok speaks the summary and a short strengths list.
+  # Set XAI_API_KEY. Do not put the key in this file.
+  # Endpoint: POST https://api.x.ai/v1/tts
+  # Model: grok-tts. Built-in voices: eve, ara, leo, rex, sal.
+  # playback false still saves the wav next to the report.
+  enabled: true
+  voice_id: eve
+  language: en
+  playback: true

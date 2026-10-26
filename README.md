@@ -31,6 +31,8 @@ uv run python main.py --ask "how was my pace?"             # one Gemma reply, th
 uv sync --group earbud                               # Windows media-session buttons
 uv run python main.py --listen-keys                    # smtc and hook events; Ctrl+C stops
 uv run python main.py --camera 0 --display --earbud    # earbud button toggles Ask Gemma
+uv sync --group stt                                  # transcribe the live talk
+uv run python main.py --demo --no-voice              # summary without Grok speech
 ```
 
 `--timer 20` shortens the presentation clock so the border glow moves from clear, to amber under 25% remaining, to red under 10%. The config default is a 5 minute talk.
@@ -91,6 +93,39 @@ uv run python main.py --camera 0 --display --earbud
 `--listen-keys` starts both backends for about 15 seconds and prefixes each line with `smtc` or `hook`. Ordinary keys are not printed. Ctrl+C stops it. If a button prints nothing, Windows is not exposing it as a media-session button or a media virtual key. Do not type passwords during that window.
 
 Esc, Q, closing the preview, and Ctrl+C in the terminal all end the session and stop the listener (unhook, stop the media player, and join threads). A second Ctrl+C kills the process if the first one is stuck. Off Windows, or if neither backend can start, Wingman logs that once and `V` still works.
+
+## Running conversation summary
+
+During the session, Flash Lite (`insight.model`, default `gemini-3.5-flash-lite`, override `INSIGHT_MODEL`) keeps a running summary of the talk. Each update sends only the previous summary, the new stretch of speech, and one line of coaching numbers. It does not send the whole transcript again. The work runs on its own thread, with its own client and lock, so it does not wait on the frame loop, the insight bullets, or Gemma. It never calls `GemmaClient`.
+
+Speech text uses the same local transcriber as a spoken ask. Install it with:
+
+```bash
+uv sync --group stt
+```
+
+Without that group, the summary still updates from the coaching line and says the speech was not transcribed. `summary.enabled` turns the feature off. `summary.interval_seconds` (default 20) is how often a new stretch is folded in.
+
+When the session ends, Wingman asks Flash for a final wording of that running summary and prints it as `Conversation: ...`. The same text is the `## Conversation` section in `reports/session-<timestamp>.md`. If Flash is offline or the call fails, a short local line is used and the strengths report is still written.
+
+## Grok voice
+
+After that summary and the strengths list exist, Wingman can speak them. The call is xAI's text-to-speech API:
+
+- Endpoint: `POST https://api.x.ai/v1/tts`
+- Model: `grok-tts` (the request body does not take a separate model field)
+- Voices: `eve` (default), `ara`, `leo`, `rex`, `sal`, or a custom voice id
+- Key: `XAI_API_KEY` (never put it in the config file)
+
+```bash
+export XAI_API_KEY="your key"
+uv run python main.py --demo
+uv run python main.py --camera 0 --display
+uv run python main.py --demo --no-voice-playback   # save the wav, do not play it
+uv run python main.py --demo --no-voice            # skip the call
+```
+
+`voice.enabled`, `voice.voice_id`, `voice.language`, and `voice.playback` are in `config/default_config.yaml`. Playback goes through the same speaker stream as the cue chimes. The wav is saved next to the report as `reports/session-<timestamp>.wav`. If the key is missing, the call fails, or there is no speaker, Wingman prints the summary and continues.
 
 ## Hotkeys
 

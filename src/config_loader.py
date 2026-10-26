@@ -147,6 +147,25 @@ class AskConfig:
 
 
 @dataclasses.dataclass
+class SummaryConfig:
+    """Running talk summary on the Flash Lite model. Not the Gemma path."""
+
+    enabled: bool = True
+    interval_seconds: float = 20.0
+    max_output_tokens: int = 512
+
+
+@dataclasses.dataclass
+class VoiceConfig:
+    """Post-session Grok speech. The key is the XAI_API_KEY environment variable."""
+
+    enabled: bool = True
+    voice_id: str = "eve"
+    language: str = "en"
+    playback: bool = True
+
+
+@dataclasses.dataclass
 class Theme:
     key: str
     name: str
@@ -170,6 +189,8 @@ class AppConfig:
     insight: InsightConfig = dataclasses.field(default_factory=InsightConfig)
     gemma: GemmaConfig = dataclasses.field(default_factory=GemmaConfig)
     ask: AskConfig = dataclasses.field(default_factory=AskConfig)
+    summary: SummaryConfig = dataclasses.field(default_factory=SummaryConfig)
+    voice: VoiceConfig = dataclasses.field(default_factory=VoiceConfig)
     themes: dict[str, Theme] = dataclasses.field(default_factory=dict)
 
     def theme(self, name: str | None = None) -> Theme:
@@ -297,6 +318,18 @@ def _validate(config: AppConfig) -> None:
     if backend not in {"auto", "smtc", "hook"}:
         raise ValueError("ask.media_key.backend must be auto, smtc, or hook")
     config.ask.media_key.backend = backend
+    if float(config.summary.interval_seconds) < 5:
+        raise ValueError("summary.interval_seconds must be at least 5")
+    if int(config.summary.max_output_tokens) < 64:
+        raise ValueError("summary.max_output_tokens must be at least 64")
+    voice_id = str(config.voice.voice_id).strip()
+    if not voice_id:
+        raise ValueError("voice.voice_id must not be empty")
+    config.voice.voice_id = voice_id
+    language = str(config.voice.language).strip()
+    if not language:
+        raise ValueError("voice.language must not be empty")
+    config.voice.language = language
     if config.hud.avatar.anchor != "sidebar_top":
         raise ValueError("hud.avatar.anchor must be 'sidebar_top'")
     if not 0 < float(config.hud.avatar.height_ratio) <= 1:

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from src.audio.audio_feedback import AudioOutput, chime_for_cue
+from src.audio.grok_voice import speak_after_session
 from src.audio.media_keys import MediaKeyListener, listen_for_keys
 from src.audio.pace_analyzer import PaceAnalyzer
 from src.audio.speech_transcriber import (
@@ -37,6 +38,11 @@ from src.intelligence.gemma_client import (
     render_report_markdown,
 )
 from src.intelligence.insight_client import InsightClient
+from src.intelligence.talk_summary import (
+    FlashSummaryClient,
+    TalkSummarizer,
+    stretch_metrics,
+)
 from src.intelligence.session_stats import SessionStats, save_report
 from src.vision.audience_tells import analyze_audience, tells_from_blendshapes
 from src.vision.gaze_tracker import GazeTracker
@@ -65,6 +71,8 @@ class RunOptions:
     ask: str | None = None
     earbud: bool = False
     listen_keys: bool = False
+    no_voice: bool = False
+    no_voice_playback: bool = False
 
 
 @dataclass
@@ -88,6 +96,7 @@ class RunSummary:
     first_frame: np.ndarray | None = None
     last_frame: np.ndarray | None = None
     error: str | None = None
+    talk_summary: str = ""
 
     @property
     def cue_types(self) -> list[str]:
@@ -170,6 +179,16 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
             "for 15 seconds, then exit. Ctrl+C stops early."
         ),
     )
+    parser.add_argument(
+        "--no-voice",
+        action="store_true",
+        help="Do not call Grok voice after the session",
+    )
+    parser.add_argument(
+        "--no-voice-playback",
+        action="store_true",
+        help="Save the Grok voice wav but do not play it",
+    )
     args = parser.parse_args(argv)
     demo = bool(args.demo or (args.camera is None and args.video is None))
     if args.camera is not None or args.video is not None:
@@ -193,6 +212,8 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         ask=args.ask,
         earbud=args.earbud,
         listen_keys=args.listen_keys,
+        no_voice=args.no_voice,
+        no_voice_playback=args.no_voice_playback,
     )
 
 
@@ -238,6 +259,9 @@ def run_session(
     transcriber: SpeechTranscriber | None = None,
     media_listener: MediaKeyListener | None = None,
     should_stop=None,
+    talk_summarizer: TalkSummarizer | None = None,
+    voice_transport=None,
+    voice_player=None,
 ) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
@@ -336,6 +360,19 @@ def run_session(
         fallback=insight_client.used_fallback,
     )
     asker = AskGemma(gemma_client)
+    summarizer = talk_summarizer
+    if summarizer is None and app_config.summary.enabled:
+        summarizer = TalkSummarizer(
+            FlashSummaryClient.from_env(
+                model=app_config.insight.model,
+                offline=options.offline,
+                timeout=app_config.insight.timeout_seconds,
+                max_output_tokens=app_config.summary.max_output_tokens,
+                thinking_level=app_config.insight.thinking_level,
+            ),
+            load_transcriber=load_transcriber,
+            interval_seconds=app_config.summary.interval_seconds,
+        )
     composer = AskComposer()
     recorder = SpeechRecorder()
     transcriber_box: dict[str, SpeechTranscriber | None] = {"value": transcriber}
@@ -498,6 +535,17 @@ def run_session(
             volume.threshold_db = control.effective_speak_up_db()
             volume_reading = volume.update(audio, timestamp)
             pace_reading = pace.update(audio, timestamp)
+            if summarizer is not None:
+                summarizer.add_audio(
+                    audio,
+                    sample_rate,
+                    stretch_metrics(
+                        volume_reading.db,
+                        pace_reading.wpm,
+                        bool(gaze_state.cue),
+                        False if posture is None else bool(posture.straighten),
+                    ),
+                )
             audio_action = control.handle_audio(audio, timestamp)
             if audio_action:
                 summary.actions.append((timestamp, audio_action))
@@ -662,13 +710,47 @@ def run_session(
             media_listener.stop()
         window = stats.overall(summary.duration)
         asker.close()
+        talk = ""
+        if summarizer is not None:
+            talk = summarizer.finish(
+                stretch_metrics(
+                    window.avg_db,
+                    window.avg_wpm,
+                    window.gaze_away_ratio >= 0.25,
+                    window.posture_ratio >= 0.25,
+                )
+            )
+        summary.talk_summary = talk
+        if talk:
+            print(f"Conversation: {talk}", flush=True)
         source, strengths, improve = gemma_client.report(window)
-        summary.report = render_report_markdown(window, strengths, improve, source)
+        summary.report = render_report_markdown(
+            window, strengths, improve, source, talk_summary=talk
+        )
+        report_path = None
         try:
-            path = save_report(summary.report, REPO_ROOT / "reports")
-            summary.notes.append(f"report {path}")
+            report_path = save_report(summary.report, REPO_ROOT / "reports")
+            summary.notes.append(f"report {report_path}")
         except OSError as exc:
             summary.notes.append(f"report was not saved ({exc})")
+        voice = speak_after_session(
+            talk,
+            strengths,
+            improve,
+            enabled=app_config.voice.enabled and not options.no_voice,
+            playback=app_config.voice.playback and not options.no_voice_playback,
+            voice_id=app_config.voice.voice_id,
+            language=app_config.voice.language,
+            report_path=report_path,
+            player=voice_player,
+            transport=voice_transport,
+        )
+        if voice.skipped and voice.skipped != "disabled":
+            summary.notes.append(f"Grok voice skipped ({voice.skipped}).")
+        if voice.path is not None:
+            summary.notes.append(f"voice {voice.path}")
+        if voice.error:
+            summary.notes.append(f"Grok voice was not played ({voice.error}).")
         summary.insight_ok = insight_client.succeeded
         summary.insight_failed = insight_client.failed
         summary.insight_avg = insight_client.average_latency
