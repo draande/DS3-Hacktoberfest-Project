@@ -27,6 +27,12 @@ uv run python main.py --demo --display                 # borderless fullscreen p
 uv run python main.py --demo --timer 20 --display          # preview the edge vignette
 uv run python main.py --demo --theme minimalist
 uv run python main.py --offline                            # ignore a Gemma API key
+uv run python main.py --ask "how was my pace?"             # one Gemma reply, then exit
+uv sync --group earbud                               # Windows media-session buttons
+uv run python main.py --listen-keys                    # smtc and hook events; Ctrl+C stops
+uv run python main.py --camera 0 --display --earbud    # earbud button toggles Ask Gemma
+uv sync --group stt                                  # transcribe the live talk
+uv run python main.py --demo --no-voice              # summary without Grok speech
 ```
 
 `--timer 20` shortens the presentation clock so the border glow moves from clear, to amber under 25% remaining, to red under 10%. The config default is a 5 minute talk.
@@ -50,13 +56,76 @@ Posture, volume, pace, and gaze are decided on the device every frame. If severa
 
 ## Gemma
 
-Gemma writes two slow things: a trend every `gemma.min_interval_seconds` (18s) and a short report when the session ends. The default model is `gemma-4-26b-a4b-it`. `GEMMA_MODEL` overrides `gemma.model`. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable it. With no key, the same slots are filled locally and nothing is sent over the network.
+Two models, used separately. The periodic trend uses `insight.model` (`gemini-3.5-flash-lite`). `INSIGHT_MODEL` overrides it. That call sets thinking to `minimal`, asks for JSON, and caps the reply at `insight.max_output_tokens` (256). The timeout is `insight.timeout_seconds` (10, the shortest deadline Google accepts) and the client is created once and reused. With paid credits the gap between trends is `insight.min_interval_seconds` (8). A 429 or 504 still backs off exponentially. One trend call is in flight at a time, and that loop does not share a lock or an HTTP client with the slow Gemma client.
 
-Each insight call sends a compact summary of the last 45 seconds (cue counts, average dB, WPM, gaze-away, posture), not the raw frame history. Output room is `gemma.max_output_tokens` (2048) so the model's thinking tokens do not come back as an empty reply. The client timeout defaults to 45 seconds and cannot be configured below 10, which the API rejects. A 429 or 504 backs off exponentially. Every call logs its latency, and the end summary includes `gemma_avg`.
+Gemma (`gemma.model`, default `gemma-4-26b-a4b-it`, override `GEMMA_MODEL`) is only the slow path: the end-of-session report, and `GemmaClient.generate` for a direct question. It keeps the large output cap (2048) and does not send a thinking config or JSON response mode, because gemma-4 spends hidden thinking tokens and rejects those controls. A slow Gemma question or report cannot delay the periodic trend loop. Set `GEMMA_API_KEY`, `GOOGLE_API_KEY`, or `GEMINI_API_KEY` to enable either model. With no key, the same slots are filled locally and nothing is sent over the network.
+
+Each insight call sends a compact summary of the last 45 seconds (cue counts, average dB, WPM, gaze-away, posture), not the raw frame history. Every call logs its latency with the model name. The end summary includes `insight_avg` and `gemma_avg` separately.
 
 The sidebar shows those trend lines under an `INSIGHT` label, next to the instant cue bullets. The badge reads `GEMMA` after a reply, `THINKING` while a call is in flight, and `OFFLINE` otherwise.
 
 When the session ends, Wingman asks for three strengths and three things to improve, prints them, and saves `reports/session-<timestamp>.md`. If that call fails, the file is still written from the local numbers. The frame loop never waits on either call. The test suite clears the key and model variables and uses fake transports.
+
+## Ask Gemma
+
+A direct question calls `GemmaClient.generate` on Gemma's own thread. It uses `gemma.model` and `gemma.timeout_seconds`. It does not use the insight client, that client's lock, its SDK client, or its pending flag, and the request does not include a thinking config or a JSON response type. An ask cannot delay the periodic trend loop. Only one ask is sent at a time. A second question waits until that call returns.
+
+In a preview, `G` opens a one-line bar. Enter sends it, Esc cancels it, and letters typed there do not fire other shortcuts. `F`, Esc, and `Q` behave as usual while the bar is closed. `V` toggles push-to-talk on the microphone samples the frame loop is already reading, and stops on its own after 30 seconds. `--ask "how was my pace?"` prints the question and a 1–3 line reply, then exits without a window or a camera. `--ask` on its own, or `--ask -`, reads one line from stdin.
+
+The sidebar shows `YOU`, then `THINKING...` with the elapsed seconds, then `ASK` and the reply. The reply stays up longer than a cue bullet. A timeout, 429, or 504 is one short error line. The frame loop never waits on the call.
+
+`gemma-4-26b-a4b-it` does not accept audio, so a spoken ask is transcribed first. `uv sync --group stt` installs `faster-whisper` for that. E2B, E4B, and 12B models can take the wav directly. With no transcriber and a text-only model, the sidebar says to type with `G` instead.
+
+The earbud button is the same push-to-talk action as `V`. `--earbud`, or `ask.media_key.enabled: true`, installs a global listener, so the Wingman window does not have to be focused. The first tap starts recording and the second sends it. It also stops on its own after 30 seconds. The default button is Play/Pause. `ask.media_key.keys` can also list `next`, `previous`, `stop`, `headset`, or a virtual-key code such as `0xB3`. Down/up pairs and repeats closer than 300 ms count as one tap. The HUD shows `EARBUD` while a backend is active, and startup prints which backend that is.
+
+Bluetooth buttons on Windows arrive through the system media session, not as keyboard keys. That backend is the primary one. On Windows:
+
+```bash
+uv sync --group earbud
+uv run python main.py --listen-keys
+uv run python main.py --camera 0 --display --earbud
+```
+
+`uv sync --group earbud` installs the WinRT media packages (`winrt-Windows.Media`, `winrt-Windows.Media.Playback`, `winrt-Windows.Media.Core`, and `winrt-Windows.Foundation`). They are Windows-only. Wingman then owns a silent looping session titled "Wingman – Ask Gemma", enables play, pause, next, and previous, and listens for `ButtonPressed`. Play, Pause, and Play/Pause are a tap. Next and previous count only when those keys are listed. While the session is active, Windows routes those buttons to Wingman, so another music app may pause until Wingman exits.
+
+`ask.media_key.backend` is `auto` (default), `smtc`, or `hook`. Auto uses the media session when it starts, and otherwise a low-level keyboard hook (`WH_KEYBOARD_LL`) on a daemon thread. The hook ignores every key that is not in the configured set, so it does not run Python on ordinary typing. `ask.media_key.suppress` defaults to true and applies only to that hook: those keys are swallowed. The media session does not use the flag.
+
+`--listen-keys` starts both backends for about 15 seconds and prefixes each line with `smtc` or `hook`. Ordinary keys are not printed. Ctrl+C stops it. If a button prints nothing, Windows is not exposing it as a media-session button or a media virtual key. Do not type passwords during that window.
+
+Esc, Q, closing the preview, and Ctrl+C in the terminal all end the session and stop the listener (unhook, stop the media player, and join threads). A second Ctrl+C kills the process if the first one is stuck. Off Windows, or if neither backend can start, Wingman logs that once and `V` still works.
+
+## Running conversation summary
+
+During the session, Flash Lite (`insight.model`, default `gemini-3.5-flash-lite`, override `INSIGHT_MODEL`) keeps a running summary of the talk. Each update sends only the previous summary, the new stretch of speech, and one line of coaching numbers. It does not send the whole transcript again. The work runs on its own thread, with its own client and lock, so it does not wait on the frame loop, the insight bullets, or Gemma. It never calls `GemmaClient`.
+
+Speech text uses the same local transcriber as a spoken ask. Install it with:
+
+```bash
+uv sync --group stt
+```
+
+Without that group, the summary still updates from the coaching line and says the speech was not transcribed. `summary.enabled` turns the feature off. `summary.interval_seconds` (default 20) is how often a new stretch is folded in.
+
+When the session ends, Wingman asks Flash for a final wording of that running summary and prints it as `Conversation: ...`. The same text is the `## Conversation` section in `reports/session-<timestamp>.md`. If Flash is offline or the call fails, a short local line is used and the strengths report is still written.
+
+## Grok voice
+
+After that summary and the strengths list exist, Wingman can speak them. The call is xAI's text-to-speech API:
+
+- Endpoint: `POST https://api.x.ai/v1/tts`
+- Model: `grok-tts` (the request body does not take a separate model field)
+- Voices: `eve` (default), `ara`, `leo`, `rex`, `sal`, or a custom voice id
+- Key: `XAI_API_KEY` (never put it in the config file)
+
+```bash
+export XAI_API_KEY="your key"
+uv run python main.py --demo
+uv run python main.py --camera 0 --display
+uv run python main.py --demo --no-voice-playback   # save the wav, do not play it
+uv run python main.py --demo --no-voice            # skip the call
+```
+
+`voice.enabled`, `voice.voice_id`, `voice.language`, and `voice.playback` are in `config/default_config.yaml`. Playback goes through the same speaker stream as the cue chimes. The wav is saved next to the report as `reports/session-<timestamp>.wav`. If the key is missing, the call fails, or there is no speaker, Wingman prints the summary and continues.
 
 ## Hotkeys
 
@@ -71,6 +140,9 @@ Shown while a preview window is open (`--display`):
 | S | Snooze every cue for 30 seconds |
 | M | Switch between Ironman and Minimalist |
 | `[` / `]` | More sensitive / less sensitive coaching thresholds |
+| G | Ask Gemma. Type a line, Enter sends, Esc cancels |
+| V | Push-to-talk. Press again to send, or wait 30 seconds |
+| Earbud Play/Pause | Same as V when `--earbud` or `ask.media_key.enabled` is on. Works while the window is unfocused. The HUD shows EARBUD |
 
 Gestures, from hand landmarks:
 

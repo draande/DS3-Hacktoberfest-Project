@@ -21,6 +21,16 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
 ]
+stt = [
+    "faster-whisper>=1.1.0",
+]
+# Windows media-session earbud buttons. Other platforms resolve an empty group.
+earbud = [
+    "winrt-Windows.Foundation>=3.2 ; sys_platform == 'win32'",
+    "winrt-Windows.Media>=3.2 ; sys_platform == 'win32'",
+    "winrt-Windows.Media.Core>=3.2 ; sys_platform == 'win32'",
+    "winrt-Windows.Media.Playback>=3.2 ; sys_platform == 'win32'",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

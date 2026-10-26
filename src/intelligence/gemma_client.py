@@ -1,8 +1,12 @@
-"""Google Gemma cue arbitration with a deterministic offline fallback.
+"""Slow Gemma calls, plus the shared prompt and offline fallback helpers.
 
-When ``GEMMA_API_KEY`` (or ``GOOGLE_API_KEY`` / ``GEMINI_API_KEY``) is unset,
-``GemmaClient`` never touches the network. The fallback ranks the same signals
-the prompt describes and returns the HUD JSON schema from PLAN.md.
+Periodic insight trends go through :class:`src.intelligence.insight_client.InsightClient`
+(Flash Lite). This module's :class:`GemmaClient` is only the slow path: the
+end-of-session report, and ``generate`` for a direct Ask Gemma question.
+Those two clients do not share a lock or an HTTP client, so a long Gemma
+reply cannot delay the insight loop.
+
+When no API key is set, nothing here touches the network.
 """
 
 from __future__ import annotations
@@ -131,9 +135,9 @@ def bullets_for_display(display_text: str, raw=None) -> list[str]:
     return [fallback] if fallback else []
 
 
-def resolve_model(config_model: str) -> str:
-    """``GEMMA_MODEL`` wins over the YAML model. A blank value does not."""
-    override = os.environ.get("GEMMA_MODEL", "").strip()
+def resolve_model(config_model: str, env_var: str = "GEMMA_MODEL") -> str:
+    """An environment override wins over the YAML model. A blank value does not."""
+    override = os.environ.get(env_var, "").strip()
     return override or config_model
 
 
@@ -410,6 +414,7 @@ def render_report_markdown(
     strengths: list[str],
     improve: list[str],
     source: str,
+    talk_summary: str = "",
 ) -> str:
     counts = (
         ", ".join(f"{key} {value}" for key, value in sorted(window.cue_counts.items()))
@@ -417,9 +422,13 @@ def render_report_markdown(
     )
     strength_lines = "\n".join(f"- {line}" for line in strengths)
     improve_lines = "\n".join(f"- {line}" for line in improve)
+    conversation = ""
+    if talk_summary and str(talk_summary).strip():
+        conversation = f"## Conversation\n\n{str(talk_summary).strip()}\n\n"
     return (
         "# Wingman session\n\n"
         f"Source: {source}\n\n"
+        f"{conversation}"
         "## Strengths\n\n"
         f"{strength_lines}\n\n"
         "## Work on\n\n"
@@ -445,11 +454,14 @@ def _is_backoff(exc: BaseException) -> bool:
 
 
 class GemmaClient:
-    """Background insight client. Real-time cues never come from here.
+    """Slow Gemma client. Not the periodic insight loop.
 
-    ``poll`` keeps at most one request in flight and returns immediately.
-    A 504 or 429 stretches the wait exponentially. ``report`` is the one
-    blocking call, used after the session ends.
+    ``report`` blocks, and the session calls it only after the frame loop
+    has finished. ``generate`` is the same completion path for Ask Gemma:
+    call it from that feature's own thread. Neither method shares state
+    with the Flash Lite insight client. Gemma 4 rejects thinking controls
+    and spends hidden thinking tokens, so this path sends neither a
+    thinking config nor a JSON mime type, and it keeps a large output cap.
     """
 
     def __init__(
@@ -491,6 +503,8 @@ class GemmaClient:
         self._job_id = 0
         self._settled: set[int] = set()
         self._closed = False
+        self._sdk = None
+        self._call_lock = threading.Lock()
 
     @classmethod
     def from_env(
@@ -554,32 +568,19 @@ class GemmaClient:
                 return None
             return sum(self._latencies) / len(self._latencies)
 
-    def insights(self, window: CoachWindow) -> list[str] | None:
-        """Blocking insight call. Does not produce a HUD cue."""
-        if self.offline or (self.transport is None and not self.api_key):
-            self.used_fallback = True
-            return None
-        started = time.perf_counter()
-        try:
-            bullets = self._evaluate(window)
-        except Exception as exc:
-            self._note_failure(exc, latency=time.perf_counter() - started)
-            return None
-        self._note_success(bullets, latency=time.perf_counter() - started)
-        return bullets
+    def generate(self, prompt: str, audio_wav: bytes | None = None) -> str:
+        """Blocking Gemma completion. Do not call this on the frame-loop thread.
 
-    def poll(self, window: CoachWindow, now: float | None = None) -> list[str] | None:
-        """Start an insight if one is due. Never waits, never returns a live cue."""
-        if not self.offline and (self.transport is not None or self.api_key):
-            self._maybe_start(window, time.monotonic() if now is None else float(now))
-        with self._lock:
-            pending = self._pending
-            live = self._live
-            bullets = None if not self._bullets else list(self._bullets)
-        self.used_fallback = pending or not live
-        if not live:
-            return None
-        return bullets
+        Ask Gemma calls this from its own worker. The Flash insight client
+        never calls it, and this does not take that client's lock or SDK.
+        ``audio_wav`` is only for models that accept inline audio. The
+        request still has no thinking config and no JSON mime type.
+        """
+        if self._closed:
+            raise RuntimeError("Gemma client is closed")
+        if self.offline or (self.transport is None and not self.api_key):
+            raise RuntimeError("Gemma is offline")
+        return self._fetch(prompt, audio_wav)
 
     def report(self, window: CoachWindow) -> tuple[str, list[str], list[str]]:
         """One end-of-session call. Falls back locally if Gemma does not answer.
@@ -632,72 +633,11 @@ class GemmaClient:
         with self._lock:
             self._closed = True
 
-    def _wait_seconds(self) -> float:
-        return self.min_interval + self._penalty
-
-    def _maybe_start(self, window: CoachWindow, now: float) -> None:
-        with self._lock:
-            if self._closed or self._pending:
-                return
-            if (
-                self._last_submit is not None
-                and now - self._last_submit < self._wait_seconds()
-            ):
-                return
-            self._pending = True
-            self._last_submit = now
-            self._job_id += 1
-            job_id = self._job_id
-        threading.Thread(
-            target=self._worker,
-            args=(window, job_id),
-            name="wingman-gemma",
-            daemon=True,
-        ).start()
-
-    def _worker(self, window: CoachWindow, job_id: int) -> None:
-        done = threading.Event()
-        box: dict = {}
-
-        def invoke() -> None:
-            try:
-                box["bullets"] = self._evaluate(window)
-            except Exception as exc:
-                box["error"] = exc
-            finally:
-                done.set()
-
-        started = time.perf_counter()
-        threading.Thread(target=invoke, name="wingman-gemma-call", daemon=True).start()
-        if not done.wait(self.timeout):
-            self._note_failure(
-                TimeoutError(f"timed out after {self.timeout:.1f}s"),
-                job_id,
-                latency=time.perf_counter() - started,
-            )
-            done.wait()
-        elif "error" in box:
-            self._note_failure(
-                box["error"], job_id, latency=time.perf_counter() - started
-            )
-        else:
-            self._note_success(
-                box.get("bullets"), job_id, latency=time.perf_counter() - started
-            )
-        with self._lock:
-            if self._job_id == job_id:
-                self._pending = False
-
-    def _evaluate(self, window: CoachWindow) -> list[str]:
-        parsed = parse_insight_json(self._fetch(build_insight_prompt(window)))
-        if not parsed:
-            raise ValueError("unparseable Gemma response")
-        return parsed
-
-    def _fetch(self, prompt: str) -> str:
+    def _fetch(self, prompt: str, audio_wav: bytes | None = None) -> str:
         if self.transport is not None:
             return self.transport(prompt)
-        return self._call_google(prompt)
+        with self._call_lock:
+            return self._call_google(prompt, audio_wav)
 
     def _note_success(
         self,
@@ -716,7 +656,7 @@ class GemmaClient:
                 self._bullets = list(bullets)
             if latency is not None:
                 self._latencies.append(float(latency))
-                logger.info("Gemma call took %.2fs", latency)
+                logger.info("%s call took %.2fs", self.model, latency)
 
     def _note_failure(
         self,
@@ -734,7 +674,7 @@ class GemmaClient:
             self.used_fallback = True
             if latency is not None:
                 self._latencies.append(float(latency))
-                logger.info("Gemma call took %.2fs", latency)
+                logger.info("%s call took %.2fs", self.model, latency)
             if retryable:
                 if self._penalty <= 0:
                     self._penalty = self.min_interval
@@ -744,7 +684,7 @@ class GemmaClient:
             if fresh:
                 self._seen_errors.add(line)
         if fresh:
-            logger.warning("Gemma call failed: %s", line)
+            logger.warning("%s call failed: %s", self.model, line)
 
     def _claim(self, job_id: int | None) -> bool:
         if job_id is None:
@@ -754,17 +694,32 @@ class GemmaClient:
         self._settled.add(job_id)
         return True
 
-    def _call_google(self, prompt: str) -> str:
+    def _sdk_client(self):
+        """One SDK client for every Gemma call. The insight loop has its own."""
+        if self._sdk is not None:
+            return self._sdk
         from google import genai
         from google.genai import types
 
-        client = genai.Client(
+        self._sdk = genai.Client(
             api_key=self.api_key,
             http_options=types.HttpOptions(timeout=http_timeout_ms(self.timeout)),
         )
-        response = client.models.generate_content(
+        return self._sdk
+
+    def _call_google(self, prompt: str, audio_wav: bytes | None = None) -> str:
+        from google.genai import types
+
+        if audio_wav is None:
+            contents: str | list = prompt
+        else:
+            contents = [
+                types.Part.from_bytes(data=audio_wav, mime_type="audio/wav"),
+                types.Part.from_text(text=prompt),
+            ]
+        response = self._sdk_client().models.generate_content(
             model=self.model,
-            contents=prompt,
+            contents=contents,
             config=types.GenerateContentConfig(
                 max_output_tokens=self.max_output_tokens
             ),

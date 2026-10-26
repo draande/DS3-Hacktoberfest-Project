@@ -24,11 +24,27 @@ def test_default_config_loads_plan_thresholds():
     assert config.timer.duration_seconds == 300
     assert config.audio.sample_rate == 16000
     assert config.hud.fps == 30
+    assert config.insight.model == "gemini-3.5-flash-lite"
+    assert config.insight.min_interval_seconds == 8
+    assert config.insight.timeout_seconds == 10
+    assert config.insight.max_output_tokens == 256
+    assert config.insight.thinking_level == "minimal"
     assert config.gemma.model == "gemma-4-26b-a4b-it"
     assert config.gemma.min_interval_seconds == 18
     assert config.gemma.timeout_seconds == 45
     assert config.gemma.report_timeout_seconds == 90
     assert config.gemma.max_output_tokens == 2048
+    assert config.ask.media_key.enabled is False
+    assert config.ask.media_key.keys == ["play_pause"]
+    assert config.ask.media_key.suppress is True
+    assert config.ask.media_key.backend == "auto"
+    assert config.summary.enabled is True
+    assert config.summary.interval_seconds == 20
+    assert config.summary.max_output_tokens == 512
+    assert config.voice.enabled is True
+    assert config.voice.voice_id == "eve"
+    assert config.voice.language == "en"
+    assert config.voice.playback is True
     assert config.posture.calibrate_seconds == 3.0
     assert config.posture.slouch_margin_degrees == 8.0
     assert config.hud.theme == "ironman"
@@ -91,6 +107,47 @@ def test_gemma_timeout_under_ten_seconds_is_rejected(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("gemma:\n  timeout_seconds: 8\n", encoding="utf-8")
     with pytest.raises(ValueError, match="at least 10"):
+        load_config(config_path)
+
+
+def test_insight_timeout_under_ten_seconds_is_rejected(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("insight:\n  timeout_seconds: 8\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="insight.timeout_seconds"):
+        load_config(config_path)
+
+
+def test_unknown_thinking_level_is_rejected(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("insight:\n  thinking_level: huge\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="thinking_level"):
+        load_config(config_path)
+
+
+def test_voice_id_must_not_be_empty(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("voice:\n  voice_id: '  '\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="voice_id"):
+        load_config(config_path)
+
+
+def test_unknown_media_backend_is_rejected(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ask:\n  media_key:\n    backend: keyboard\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="backend"):
+        load_config(config_path)
+
+
+def test_unknown_media_key_is_rejected(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ask:\n  media_key:\n    keys:\n      - not-a-key\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown media key"):
         load_config(config_path)
 
 

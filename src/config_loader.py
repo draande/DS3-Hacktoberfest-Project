@@ -108,12 +108,61 @@ class AudioStreamConfig:
 
 
 @dataclasses.dataclass
+class InsightConfig:
+    """Fast periodic trends. Separate from the slow Gemma client."""
+
+    model: str = "gemini-3.5-flash-lite"
+    min_interval_seconds: float = 8.0
+    timeout_seconds: float = 10.0
+    max_output_tokens: int = 256
+    thinking_level: str = "minimal"
+
+
+@dataclasses.dataclass
 class GemmaConfig:
+    """Slow report and Ask Gemma settings. The insight loop does not read these."""
+
     model: str = "gemma-4-26b-a4b-it"
     min_interval_seconds: float = 18.0
     timeout_seconds: float = 45.0
     report_timeout_seconds: float = 90.0
     max_output_tokens: int = 2048
+
+
+@dataclasses.dataclass
+class MediaKeyConfig:
+    """Global earbud button. Off unless enabled or the session is started with --earbud."""
+
+    enabled: bool = False
+    keys: list[str] = dataclasses.field(default_factory=lambda: ["play_pause"])
+    suppress: bool = True
+    backend: str = "auto"
+
+
+@dataclasses.dataclass
+class AskConfig:
+    """Ask Gemma input. The insight loop does not read this."""
+
+    media_key: MediaKeyConfig = dataclasses.field(default_factory=MediaKeyConfig)
+
+
+@dataclasses.dataclass
+class SummaryConfig:
+    """Running talk summary on the Flash Lite model. Not the Gemma path."""
+
+    enabled: bool = True
+    interval_seconds: float = 20.0
+    max_output_tokens: int = 512
+
+
+@dataclasses.dataclass
+class VoiceConfig:
+    """Post-session Grok speech. The key is the XAI_API_KEY environment variable."""
+
+    enabled: bool = True
+    voice_id: str = "eve"
+    language: str = "en"
+    playback: bool = True
 
 
 @dataclasses.dataclass
@@ -137,7 +186,11 @@ class AppConfig:
     cues: CueConfig = dataclasses.field(default_factory=CueConfig)
     hud: HudConfig = dataclasses.field(default_factory=HudConfig)
     audio: AudioStreamConfig = dataclasses.field(default_factory=AudioStreamConfig)
+    insight: InsightConfig = dataclasses.field(default_factory=InsightConfig)
     gemma: GemmaConfig = dataclasses.field(default_factory=GemmaConfig)
+    ask: AskConfig = dataclasses.field(default_factory=AskConfig)
+    summary: SummaryConfig = dataclasses.field(default_factory=SummaryConfig)
+    voice: VoiceConfig = dataclasses.field(default_factory=VoiceConfig)
     themes: dict[str, Theme] = dataclasses.field(default_factory=dict)
 
     def theme(self, name: str | None = None) -> Theme:
@@ -219,6 +272,22 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("hud.sidebar.fade_seconds cannot be negative")
     if float(config.hud.sidebar.fade_seconds) >= float(config.hud.sidebar.ttl_seconds):
         raise ValueError("hud.sidebar.fade_seconds must be shorter than ttl_seconds")
+    if float(config.insight.min_interval_seconds) <= 0:
+        raise ValueError("insight.min_interval_seconds must be positive")
+    if float(config.insight.timeout_seconds) < 10:
+        raise ValueError(
+            "insight.timeout_seconds must be at least 10 seconds; "
+            "shorter deadlines are rejected by the API"
+        )
+    if int(config.insight.max_output_tokens) < 32:
+        raise ValueError("insight.max_output_tokens must be at least 32")
+    if str(config.insight.thinking_level).lower() not in {
+        "minimal",
+        "low",
+        "medium",
+        "high",
+    }:
+        raise ValueError("insight.thinking_level must be minimal, low, medium, or high")
     if float(config.gemma.min_interval_seconds) <= 0:
         raise ValueError("gemma.min_interval_seconds must be positive")
     if float(config.gemma.timeout_seconds) < 10:
@@ -239,6 +308,28 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("posture.slouch_margin_degrees must be positive")
     if float(config.posture.forward_margin) <= 0:
         raise ValueError("posture.forward_margin must be positive")
+    from src.audio.media_keys import parse_media_key
+
+    if not list(config.ask.media_key.keys):
+        raise ValueError("ask.media_key.keys must list at least one key")
+    for key in config.ask.media_key.keys:
+        parse_media_key(key)
+    backend = str(config.ask.media_key.backend).strip().lower()
+    if backend not in {"auto", "smtc", "hook"}:
+        raise ValueError("ask.media_key.backend must be auto, smtc, or hook")
+    config.ask.media_key.backend = backend
+    if float(config.summary.interval_seconds) < 5:
+        raise ValueError("summary.interval_seconds must be at least 5")
+    if int(config.summary.max_output_tokens) < 64:
+        raise ValueError("summary.max_output_tokens must be at least 64")
+    voice_id = str(config.voice.voice_id).strip()
+    if not voice_id:
+        raise ValueError("voice.voice_id must not be empty")
+    config.voice.voice_id = voice_id
+    language = str(config.voice.language).strip()
+    if not language:
+        raise ValueError("voice.language must not be empty")
+    config.voice.language = language
     if config.hud.avatar.anchor != "sidebar_top":
         raise ValueError("hud.avatar.anchor must be 'sidebar_top'")
     if not 0 < float(config.hud.avatar.height_ratio) <= 1:

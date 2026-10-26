@@ -3,27 +3,45 @@
 from __future__ import annotations
 
 import argparse
+import signal
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from src.audio.audio_feedback import AudioOutput, chime_for_cue
+from src.audio.grok_voice import speak_after_session
+from src.audio.media_keys import MediaKeyListener, listen_for_keys
 from src.audio.pace_analyzer import PaceAnalyzer
+from src.audio.speech_transcriber import (
+    SpeechTranscriber,
+    load_transcriber,
+    prepare_spoken_ask,
+)
 from src.audio.volume_analyzer import VolumeAnalyzer
 from src.capture.audio_stream import AudioCaptureError, MicrophoneStream
 from src.capture.video_stream import CameraUnavailable, FileVideoSource, WebcamSource
 from src.config_loader import REPO_ROOT, AppConfig, load_config
 from src.controls.session_control import SessionControl
 from src.demo_scene import DemoScene
+from src.hud.ask_input import AskComposer, SpeechRecorder, dispatch_preview_key
 from src.hud.display import detect_screen_size, prepare_display_frame
 from src.hud.renderer import HudRenderer, HudState, PreviewWindow
+from src.intelligence.ask_gemma import AskGemma, AskState
 from src.intelligence.gemma_client import (
     CoachMetrics,
     GemmaClient,
     active_cues,
     offline_insights,
     render_report_markdown,
+)
+from src.intelligence.insight_client import InsightClient
+from src.intelligence.talk_summary import (
+    FlashSummaryClient,
+    TalkSummarizer,
+    stretch_metrics,
 )
 from src.intelligence.session_stats import SessionStats, save_report
 from src.vision.audience_tells import analyze_audience, tells_from_blendshapes
@@ -50,6 +68,11 @@ class RunOptions:
     chimes: bool = False
     offline: bool = False
     download_models: bool = False
+    ask: str | None = None
+    earbud: bool = False
+    listen_keys: bool = False
+    no_voice: bool = False
+    no_voice_playback: bool = False
 
 
 @dataclass
@@ -57,6 +80,9 @@ class RunSummary:
     demo: bool = True
     theme: str = "ironman"
     fallback: bool = True
+    insight_ok: int = 0
+    insight_failed: int = 0
+    insight_avg: float | None = None
     gemma_ok: int = 0
     gemma_failed: int = 0
     gemma_avg: float | None = None
@@ -70,6 +96,7 @@ class RunSummary:
     first_frame: np.ndarray | None = None
     last_frame: np.ndarray | None = None
     error: str | None = None
+    talk_summary: str = ""
 
     @property
     def cue_types(self) -> list[str]:
@@ -132,6 +159,36 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         action="store_true",
         help="Download MediaPipe .task models into models/ and exit",
     )
+    parser.add_argument(
+        "--ask",
+        nargs="?",
+        const="-",
+        default=None,
+        help="Ask Gemma one question and exit. Omit the text, or pass -, to read stdin.",
+    )
+    parser.add_argument(
+        "--earbud",
+        action="store_true",
+        help="Listen for the earbud Play/Pause button even when the window is not focused",
+    )
+    parser.add_argument(
+        "--listen-keys",
+        action="store_true",
+        help=(
+            "Print earbud events from the media session and the keyboard hook "
+            "for 15 seconds, then exit. Ctrl+C stops early."
+        ),
+    )
+    parser.add_argument(
+        "--no-voice",
+        action="store_true",
+        help="Do not call Grok voice after the session",
+    )
+    parser.add_argument(
+        "--no-voice-playback",
+        action="store_true",
+        help="Save the Grok voice wav but do not play it",
+    )
     args = parser.parse_args(argv)
     demo = bool(args.demo or (args.camera is None and args.video is None))
     if args.camera is not None or args.video is not None:
@@ -152,18 +209,29 @@ def parse_args(argv: list[str] | None = None) -> RunOptions:
         chimes=args.chimes,
         offline=args.offline,
         download_models=args.download_models,
+        ask=args.ask,
+        earbud=args.earbud,
+        listen_keys=args.listen_keys,
+        no_voice=args.no_voice,
+        no_voice_playback=args.no_voice_playback,
     )
+
+
+def _latency_field(name: str, value: float | None) -> str:
+    if value is None:
+        return ""
+    return f" {name}={value:.1f}s"
 
 
 def format_summary(summary: RunSummary) -> str:
     mode = "demo" if summary.demo else "live"
     coaching = "offline" if summary.fallback else "gemma"
-    latency = (
-        "" if summary.gemma_avg is None else f" gemma_avg={summary.gemma_avg:.1f}s"
-    )
     lines = [
         f"Wingman {mode} | theme={summary.theme} | coaching={coaching} | "
-        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed}{latency} | "
+        f"insight_ok={summary.insight_ok} insight_failed={summary.insight_failed}"
+        f"{_latency_field('insight_avg', summary.insight_avg)} | "
+        f"gemma_ok={summary.gemma_ok} gemma_failed={summary.gemma_failed}"
+        f"{_latency_field('gemma_avg', summary.gemma_avg)} | "
         f"frames={summary.frames}"
     ]
     events = [
@@ -185,7 +253,15 @@ def format_summary(summary: RunSummary) -> str:
 def run_session(
     options: RunOptions,
     config: AppConfig | None = None,
-    client: GemmaClient | None = None,
+    client: InsightClient | None = None,
+    insight_client: InsightClient | None = None,
+    gemma_client: GemmaClient | None = None,
+    transcriber: SpeechTranscriber | None = None,
+    media_listener: MediaKeyListener | None = None,
+    should_stop=None,
+    talk_summarizer: TalkSummarizer | None = None,
+    voice_transport=None,
+    voice_player=None,
 ) -> RunSummary:
     app_config = config or load_config()
     if options.download_models:
@@ -257,8 +333,19 @@ def run_session(
     )
     gestures = GestureDetector()
     stats = SessionStats(window_seconds=45.0)
-    if client is None:
-        client = GemmaClient.from_env(
+    if insight_client is None:
+        insight_client = client
+    if insight_client is None:
+        insight_client = InsightClient.from_env(
+            model=app_config.insight.model,
+            offline=options.offline,
+            min_interval=app_config.insight.min_interval_seconds,
+            timeout=app_config.insight.timeout_seconds,
+            max_output_tokens=app_config.insight.max_output_tokens,
+            thinking_level=app_config.insight.thinking_level,
+        )
+    if gemma_client is None:
+        gemma_client = GemmaClient.from_env(
             model=app_config.gemma.model,
             duration_ms=app_config.cues.duration_ms,
             offline=options.offline,
@@ -268,8 +355,38 @@ def run_session(
             max_output_tokens=app_config.gemma.max_output_tokens,
         )
     summary = RunSummary(
-        demo=options.demo, theme=control.theme_name, fallback=client.used_fallback
+        demo=options.demo,
+        theme=control.theme_name,
+        fallback=insight_client.used_fallback,
     )
+    asker = AskGemma(gemma_client)
+    summarizer = talk_summarizer
+    if summarizer is None and app_config.summary.enabled:
+        summarizer = TalkSummarizer(
+            FlashSummaryClient.from_env(
+                model=app_config.insight.model,
+                offline=options.offline,
+                timeout=app_config.insight.timeout_seconds,
+                max_output_tokens=app_config.summary.max_output_tokens,
+                thinking_level=app_config.insight.thinking_level,
+            ),
+            load_transcriber=load_transcriber,
+            interval_seconds=app_config.summary.interval_seconds,
+        )
+    composer = AskComposer()
+    recorder = SpeechRecorder()
+    transcriber_box: dict[str, SpeechTranscriber | None] = {"value": transcriber}
+    if media_listener is None and (options.earbud or app_config.ask.media_key.enabled):
+        media_listener = MediaKeyListener(
+            keys=list(app_config.ask.media_key.keys),
+            suppress=bool(app_config.ask.media_key.suppress),
+            backend=str(app_config.ask.media_key.backend),
+        )
+    if media_listener is not None and not media_listener.started:
+        media_listener.start()
+        line = media_listener.status_line()
+        print(line, flush=True)
+        summary.notes.append(line)
     playback = _start_playback(options, app_config.audio.sample_rate, summary)
 
     scene = (
@@ -303,7 +420,11 @@ def run_session(
                 )
         except (CameraUnavailable, FileNotFoundError, RuntimeError) as exc:
             summary.error = str(exc)
-            client.close()
+            asker.close()
+            if media_listener is not None:
+                media_listener.stop()
+            insight_client.close()
+            gemma_client.close()
             if playback is not None:
                 playback.close()
             return summary
@@ -332,6 +453,9 @@ def run_session(
     pace_clock = time.perf_counter()
     try:
         while frame_limit is None or frame_index < frame_limit:
+            if should_stop is not None and should_stop():
+                summary.notes.append("Stopped.")
+                break
             timestamp = frame_index / fps
             if preview is not None:
                 target_w, target_h = preview.target_size()
@@ -411,6 +535,17 @@ def run_session(
             volume.threshold_db = control.effective_speak_up_db()
             volume_reading = volume.update(audio, timestamp)
             pace_reading = pace.update(audio, timestamp)
+            if summarizer is not None:
+                summarizer.add_audio(
+                    audio,
+                    sample_rate,
+                    stretch_metrics(
+                        volume_reading.db,
+                        pace_reading.wpm,
+                        bool(gaze_state.cue),
+                        False if posture is None else bool(posture.straighten),
+                    ),
+                )
             audio_action = control.handle_audio(audio, timestamp)
             if audio_action:
                 summary.actions.append((timestamp, audio_action))
@@ -442,7 +577,26 @@ def run_session(
                 bool(gaze_state.cue),
                 bool(metrics.posture_alert),
             )
-            client.poll(stats.recent(timestamp), timestamp)
+            insight_client.poll(stats.recent(timestamp), timestamp)
+            if recorder.add(audio, sample_rate):
+                _send_spoken_ask(
+                    asker,
+                    gemma_client.model,
+                    recorder.take(),
+                    stats.recent(timestamp),
+                    timestamp,
+                    _transcriber(transcriber_box),
+                )
+            if media_listener is not None:
+                for _tap in range(media_listener.pop_taps()):
+                    _toggle_push_to_talk(
+                        recorder,
+                        asker,
+                        gemma_client.model,
+                        stats.recent(timestamp),
+                        timestamp,
+                        transcriber_box,
+                    )
             active = control.filter.consider_many(
                 active_cues(metrics, app_config.cues.duration_ms), timestamp
             )
@@ -459,11 +613,22 @@ def run_session(
                     if playback is not None and playback.active:
                         playback.play(chime_for_cue(active["cue_type"], sample_rate))
 
-            if client.bullets and client.status in {"gemma", "thinking"}:
-                insight_lines = client.bullets
+            if insight_client.bullets and insight_client.status in {
+                "flash",
+                "thinking",
+            }:
+                insight_lines = insight_client.bullets
             else:
                 insight_lines = offline_insights(stats.recent(timestamp))
             renderer.sidebar.push_insights(insight_lines, timestamp)
+            ask_state = asker.snapshot()
+            renderer.sidebar.show_ask(
+                ask_state.question,
+                ask_state.phase,
+                ask_state.lines,
+                ask_state.started_at,
+                timestamp,
+            )
 
             remaining = max(0.0, timer_seconds - timestamp)
             ratio = remaining / timer_seconds if timer_seconds else 0.0
@@ -476,8 +641,11 @@ def run_session(
                     volume_db=volume_reading.db,
                     wpm=pace_reading.wpm,
                     pulse_t=timestamp,
-                    coaching_status=client.status,
+                    coaching_status=insight_client.status,
                     level_threshold_db=control.effective_speak_up_db(),
+                    ask_draft=None if not composer.open else composer.text,
+                    listening=recorder.active,
+                    earbud=media_listener is not None and media_listener.active,
                 ),
             )
             if summary.first_frame is None:
@@ -485,25 +653,36 @@ def run_session(
             summary.last_frame = rendered
             summary.frames = frame_index + 1
             summary.duration = timestamp
-            summary.fallback = client.used_fallback
-            summary.gemma_ok = client.succeeded
-            summary.gemma_failed = client.failed
+            summary.fallback = insight_client.used_fallback
+            summary.insight_ok = insight_client.succeeded
+            summary.insight_failed = insight_client.failed
             summary.theme = control.theme_name
 
             if preview is not None:
+                preview.text_entry = composer.open
                 key = preview.show(rendered)
-                if key == "quit":
+                dispatched = dispatch_preview_key(key, composer, control, timestamp)
+                if dispatched.quit:
                     break
-                if key in {"fullscreen", "exit_fullscreen"}:
-                    key = None
-                if key:
-                    action = control.handle_key(key, timestamp)
-                    if action == "quit":
-                        break
-                    if action:
-                        summary.actions.append((timestamp, action))
-                    if control.theme_name != renderer.theme.key:
-                        renderer.set_theme(app_config.theme(control.theme_name))
+                if preview.closed():
+                    break
+                if dispatched.submitted:
+                    asker.submit(
+                        dispatched.submitted, stats.recent(timestamp), now=timestamp
+                    )
+                if dispatched.speech_toggle:
+                    _toggle_push_to_talk(
+                        recorder,
+                        asker,
+                        gemma_client.model,
+                        stats.recent(timestamp),
+                        timestamp,
+                        transcriber_box,
+                    )
+                if dispatched.action:
+                    summary.actions.append((timestamp, dispatched.action))
+                if control.theme_name != renderer.theme.key:
+                    renderer.set_theme(app_config.theme(control.theme_name))
             if scene is not None and (
                 preview is not None or (playback is not None and playback.active)
             ):
@@ -514,6 +693,8 @@ def run_session(
                 else:
                     pace_clock = time.perf_counter()
             frame_index += 1
+    except KeyboardInterrupt:
+        summary.notes.append("Stopped.")
     finally:
         if video is not None:
             video.close()
@@ -525,19 +706,60 @@ def run_session(
             preview.close()
         if playback is not None:
             playback.close()
+        if media_listener is not None:
+            media_listener.stop()
         window = stats.overall(summary.duration)
-        source, strengths, improve = client.report(window)
-        summary.report = render_report_markdown(window, strengths, improve, source)
+        asker.close()
+        talk = ""
+        if summarizer is not None:
+            talk = summarizer.finish(
+                stretch_metrics(
+                    window.avg_db,
+                    window.avg_wpm,
+                    window.gaze_away_ratio >= 0.25,
+                    window.posture_ratio >= 0.25,
+                )
+            )
+        summary.talk_summary = talk
+        if talk:
+            print(f"Conversation: {talk}", flush=True)
+        source, strengths, improve = gemma_client.report(window)
+        summary.report = render_report_markdown(
+            window, strengths, improve, source, talk_summary=talk
+        )
+        report_path = None
         try:
-            path = save_report(summary.report, REPO_ROOT / "reports")
-            summary.notes.append(f"report {path}")
+            report_path = save_report(summary.report, REPO_ROOT / "reports")
+            summary.notes.append(f"report {report_path}")
         except OSError as exc:
             summary.notes.append(f"report was not saved ({exc})")
-        summary.gemma_ok = client.succeeded
-        summary.gemma_failed = client.failed
-        summary.gemma_avg = client.average_latency
-        summary.fallback = client.succeeded == 0
-        client.close()
+        voice = speak_after_session(
+            talk,
+            strengths,
+            improve,
+            enabled=app_config.voice.enabled and not options.no_voice,
+            playback=app_config.voice.playback and not options.no_voice_playback,
+            voice_id=app_config.voice.voice_id,
+            language=app_config.voice.language,
+            report_path=report_path,
+            player=voice_player,
+            transport=voice_transport,
+        )
+        if voice.skipped and voice.skipped != "disabled":
+            summary.notes.append(f"Grok voice skipped ({voice.skipped}).")
+        if voice.path is not None:
+            summary.notes.append(f"voice {voice.path}")
+        if voice.error:
+            summary.notes.append(f"Grok voice was not played ({voice.error}).")
+        summary.insight_ok = insight_client.succeeded
+        summary.insight_failed = insight_client.failed
+        summary.insight_avg = insight_client.average_latency
+        summary.gemma_ok = gemma_client.succeeded
+        summary.gemma_failed = gemma_client.failed
+        summary.gemma_avg = gemma_client.average_latency
+        summary.fallback = insight_client.succeeded == 0
+        insight_client.close()
+        gemma_client.close()
     return summary
 
 
@@ -560,13 +782,132 @@ def _start_playback(
     return playback
 
 
+def _transcriber(
+    box: dict[str, SpeechTranscriber | None],
+) -> SpeechTranscriber | None:
+    if "loaded" not in box:
+        box["loaded"] = True
+        if box.get("value") is None:
+            box["value"] = load_transcriber()
+    return box.get("value")
+
+
+def _toggle_push_to_talk(
+    recorder: SpeechRecorder,
+    asker: AskGemma,
+    model: str,
+    window,
+    now: float,
+    transcriber_box: dict,
+) -> None:
+    """Same action as V and as an earbud tap. The frame loop calls this."""
+    if recorder.toggle() == "stop":
+        _send_spoken_ask(
+            asker,
+            model,
+            recorder.take(),
+            window,
+            now,
+            _transcriber(transcriber_box),
+        )
+
+
+def _send_spoken_ask(
+    asker: AskGemma,
+    model: str,
+    clip: tuple[np.ndarray, int],
+    window,
+    now: float,
+    transcriber: SpeechTranscriber | None,
+) -> None:
+    samples, rate = clip
+    request = prepare_spoken_ask(samples, rate, model, transcriber)
+    if request.kind == "notice":
+        asker.notice(request.text, now=now)
+    elif request.kind == "audio":
+        asker.submit(request.text, window, audio=request.audio, now=now)
+    else:
+        asker.submit(request.text, window, now=now)
+
+
+def format_ask_output(question: str, state: AskState) -> str:
+    lines = [f"YOU: {question}"]
+    lines.extend(state.lines or ["Gemma could not answer."])
+    return "\n".join(lines)
+
+
+def run_cli_ask(
+    question: str, client: GemmaClient | None = None, offline: bool = False
+) -> str:
+    """One Gemma reply. Does not open a window or a camera."""
+    owns_client = client is None
+    if client is None:
+        config = load_config()
+        client = GemmaClient.from_env(
+            model=config.gemma.model,
+            duration_ms=config.cues.duration_ms,
+            offline=offline,
+            min_interval=config.gemma.min_interval_seconds,
+            timeout=config.gemma.timeout_seconds,
+            report_timeout=config.gemma.report_timeout_seconds,
+            max_output_tokens=config.gemma.max_output_tokens,
+        )
+    try:
+        state = AskGemma(client).ask_blocking(question)
+    finally:
+        if owns_client:
+            client.close()
+    return format_ask_output(question, state)
+
+
+def _install_stop_handler(stop_event: threading.Event):
+    """First Ctrl+C asks the loop to finish. The next one kills the process."""
+    previous = signal.getsignal(signal.SIGINT)
+
+    def _request_stop(signum, frame):
+        del signum, frame
+        stop_event.set()
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _request_stop)
+    except ValueError:
+        return None
+    return previous
+
+
 def main(argv: list[str] | None = None) -> int:
     options = parse_args(argv)
+    stop_event = threading.Event()
+    previous_sigint = _install_stop_handler(stop_event)
+    try:
+        return _main_with_stop(options, stop_event.is_set)
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
+
+
+def _main_with_stop(options: RunOptions, should_stop) -> int:
+    if options.listen_keys:
+        return listen_for_keys(stop=should_stop)
+    if options.ask is not None:
+        question = options.ask
+        if question == "-":
+            question = sys.stdin.readline().strip()
+        question = question.strip()
+        if not question:
+            print("Ask Gemma needs a question.")
+            return 2
+        print(run_cli_ask(question, offline=options.offline))
+        return 0
     if options.download_models:
-        summary = run_session(options)
+        summary = run_session(options, should_stop=should_stop)
         print(format_summary(summary))
         return 0 if summary.error is None else 1
-    summary = run_session(options)
+    summary = run_session(options, should_stop=should_stop)
     print(format_summary(summary))
     if summary.report:
         print()

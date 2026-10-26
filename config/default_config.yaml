@@ -90,13 +90,59 @@ audio:
   block_size: 256
   buffer_seconds: 2.5
 
+insight:
+  # Periodic sidebar trends. Real-time cues do not wait on this.
+  # Override with INSIGHT_MODEL. This model can be polled tighter than
+  # the slow Gemma client; one call stays in flight, and 429/504 still back off.
+  model: gemini-3.5-flash-lite
+  min_interval_seconds: 8
+  # Google rejects deadlines under 10 seconds.
+  timeout_seconds: 10
+  max_output_tokens: 256
+  # Gemini 3.5 uses thinking_level. minimal is set explicitly.
+  thinking_level: minimal
+
 gemma:
-  # gemma-3-12b-it returns 404 on AI Studio v1beta. Override with GEMMA_MODEL.
+  # Slow path only: the end-of-session report, and Ask Gemma when that
+  # feature calls GemmaClient.generate. Do not point the insight loop here.
+  # gemma-4 hides thinking tokens, so the output cap stays large and this
+  # client does not send a thinking config or JSON response mode.
+  # Override the model with GEMMA_MODEL.
   model: gemma-4-26b-a4b-it
-  # Insights only. Real-time cues do not wait on this. Google rejects
-  # deadlines under 10s, and this model often takes 16-24s.
   min_interval_seconds: 18
   timeout_seconds: 45
   report_timeout_seconds: 90
-  # Thinking tokens on gemma-4 consume a small cap and return empty text.
   max_output_tokens: 2048
+
+ask:
+  media_key:
+    # Global earbud button for Ask Gemma push-to-talk. Also --earbud.
+    # backend: auto tries the Windows media session (SMTC) first, then the
+    # keyboard hook. smtc needs `uv sync --group earbud` on Windows.
+    # keys: play_pause (default), next, previous, stop, headset, or a VK code.
+    # suppress swallows those keys on the hook only. SMTC owns the session,
+    # so other players may pause while Wingman is running.
+    enabled: false
+    backend: auto
+    keys:
+      - play_pause
+    suppress: true
+
+summary:
+  # Running summary of the talk on the Flash Lite insight model.
+  # Each update sends the previous summary plus the new stretch only.
+  # It does not call Gemma. Speech text needs `uv sync --group stt`.
+  enabled: true
+  interval_seconds: 20
+  max_output_tokens: 512
+
+voice:
+  # After the session, Grok speaks the summary and a short strengths list.
+  # Set XAI_API_KEY. Do not put the key in this file.
+  # Endpoint: POST https://api.x.ai/v1/tts
+  # Model: grok-tts. Built-in voices: eve, ara, leo, rex, sal.
+  # playback false still saves the wav next to the report.
+  enabled: true
+  voice_id: eve
+  language: en
+  playback: true

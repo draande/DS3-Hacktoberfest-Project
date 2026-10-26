@@ -4,7 +4,7 @@ import pytest
 from src.config_loader import SidebarConfig, load_config
 from src.hud.avatar import AvatarState, draw_avatar
 from src.hud.renderer import HudRenderer, HudState
-from src.hud.sidebar import FeedbackSidebar, coaching_badge_rect
+from src.hud.sidebar import BADGE_LABELS, FeedbackSidebar, coaching_badge_rect
 from src.hud.vignette import (
     apply_vignette,
     edge_mask,
@@ -233,7 +233,11 @@ def test_renderer_paints_the_sidebar_for_both_themes():
         assert int(strip.max()) > 0
 
 
-def test_coaching_badge_switches_between_gemma_thinking_and_offline():
+def test_coaching_badge_reads_gemma_thinking_or_offline():
+    assert BADGE_LABELS["flash"] == "GEMMA"
+    assert BADGE_LABELS["gemma"] == "GEMMA"
+    assert BADGE_LABELS["thinking"] == "THINKING"
+    assert BADGE_LABELS["offline"] == "OFFLINE"
     config = load_config()
     theme = config.theme("ironman")
     renderer = HudRenderer(
@@ -246,7 +250,7 @@ def test_coaching_badge_switches_between_gemma_thinking_and_offline():
     kwargs = dict(
         remaining_seconds=10, remaining_ratio=0.8, cue=None, volume_db=50, wpm=140
     )
-    live = renderer.render(frame.copy(), HudState(**kwargs, coaching_status="gemma"))
+    live = renderer.render(frame.copy(), HudState(**kwargs, coaching_status="flash"))
     thinking = renderer.render(
         frame.copy(), HudState(**kwargs, coaching_status="thinking")
     )
@@ -295,6 +299,18 @@ def test_mic_meter_shows_level_and_the_speak_up_line():
     assert tuple(int(channel) for channel in quiet[box.y + 1, mark]) == hex_to_bgr(
         theme.colors["alert"]
     )
+
+
+def test_earbud_badge_appears_only_while_a_backend_is_active():
+    config = load_config()
+    renderer = HudRenderer(config.theme("ironman"), opacity=1.0)
+    kwargs = dict(
+        remaining_seconds=10, remaining_ratio=0.9, cue=None, volume_db=40, wpm=140
+    )
+    frame = np.zeros((180, 320, 3), np.uint8)
+    off = renderer.render(frame.copy(), HudState(**kwargs, earbud=False))
+    on = renderer.render(frame.copy(), HudState(**kwargs, earbud=True))
+    assert not np.array_equal(on[6:23, 6:79], off[6:23, 6:79])
 
 
 def test_pygame_surface_matches_the_frame_size():

@@ -3,7 +3,14 @@
 import os
 
 # A developer key in the environment must not turn unit tests into network calls.
-for _name in ("GEMMA_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "GEMMA_MODEL"):
+for _name in (
+    "GEMMA_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GEMMA_MODEL",
+    "INSIGHT_MODEL",
+    "XAI_API_KEY",
+):
     os.environ.pop(_name, None)
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
